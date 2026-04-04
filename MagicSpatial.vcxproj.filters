@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="src">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\core">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\vst">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\processing">
+      <UniqueIdentifier>{D9D6E242-F8AF-46E4-B9FD-80ECBC20BA3E}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\vst\VstEntry.cpp">
+      <Filter>src\vst</Filter>
+    </ClCompile>
+    <ClCompile Include="src\vst\MagicSpatialVst.cpp">
+      <Filter>src\vst</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\Biquad.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\Decorrelator.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\UpmixEngine.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\StereoUpmixer.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\Surround51Upmixer.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+    <ClCompile Include="src\processing\Surround71Upmixer.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\core\Types.h">
+      <Filter>src\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\vst\VstDefs.h">
+      <Filter>src\vst</Filter>
+    </ClInclude>
+    <ClInclude Include="src\vst\MagicSpatialVst.h">
+      <Filter>src\vst</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\ChannelLayout.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\Biquad.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\Decorrelator.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\UpmixEngine.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\StereoUpmixer.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\Surround51Upmixer.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\Surround71Upmixer.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
