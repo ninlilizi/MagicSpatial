@@ -1,10 +1,12 @@
 #include "vst/MagicSpatialVst.h"
+#include "core/Log.h"
 
 #include <windows.h>
 #include <commctrl.h>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <vector>
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -42,29 +44,6 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
         }
         return 0;
-
-    case WM_HSCROLL: {
-        if (!plugin) break;
-        HWND slider = reinterpret_cast<HWND>(lParam);
-        int pos = static_cast<int>(SendMessageW(slider, TBM_GETPOS, 0, 0));
-        float val = static_cast<float>(pos) / 100.0f;
-        int id = GetDlgCtrlID(slider);
-
-        if (id == ID_HEIGHT_SLIDER) {
-            plugin->SetParameter(2, val);
-            // Update label
-            char buf[16];
-            std::snprintf(buf, sizeof(buf), "%d%%", pos);
-            SetDlgItemTextA(hwnd, ID_HEIGHT_LABEL, buf);
-        }
-        else if (id == ID_SURROUND_SLIDER) {
-            plugin->SetParameter(3, val);
-            char buf[16];
-            std::snprintf(buf, sizeof(buf), "%d%%", pos);
-            SetDlgItemTextA(hwnd, ID_SURROUND_LABEL, buf);
-        }
-        return 0;
-    }
 
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = reinterpret_cast<HDC>(wParam);
@@ -146,9 +125,18 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
 {
     switch (opcode) {
     case effOpen:
+        // Attempt spatial audio activation
+        if (!m_spatialInitAttempted) {
+            m_spatialInitAttempted = true;
+            m_spatialWriter.Initialize();
+            LogMsg("effOpen: SpatialObjectWriter Initialize called\n");
+        }
         return 0;
 
     case effClose:
+        // Shut down spatial audio BEFORE destruction to ensure resources
+        // are fully released before E-APO creates a new plugin instance.
+        m_spatialWriter.Shutdown();
         delete this;
         return 0;
 
@@ -246,43 +234,6 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         int spkSel = (m_paramSpeakers < 0.15f) ? 0 : (m_paramSpeakers < 0.35f) ? 1 :
                      (m_paramSpeakers < 0.55f) ? 2 : (m_paramSpeakers < 0.75f) ? 3 : 4;
         SendMessageW(spkCombo, CB_SETCURSEL, spkSel, 0);
-        y += 30;
-
-        // --- Height Gain slider ---
-        CreateWindowW(L"STATIC", L"Height:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
-        HWND hSlider = CreateWindowW(TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            ctrlX, y, ctrlW - 45, 25, hwnd,
-            reinterpret_cast<HMENU>(ID_HEIGHT_SLIDER), hInst, nullptr);
-        SendMessageW(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-        SendMessageW(hSlider, TBM_SETPOS, TRUE, static_cast<int>(m_paramHeightGain * 100.0f));
-        // Value label
-        char hBuf[16];
-        std::snprintf(hBuf, sizeof(hBuf), "%d%%", static_cast<int>(m_paramHeightGain * 100.0f));
-        CreateWindowA("STATIC", hBuf,
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            ctrlX + ctrlW - 40, y + 4, 40, 20, hwnd,
-            reinterpret_cast<HMENU>(ID_HEIGHT_LABEL), hInst, nullptr);
-        y += 30;
-
-        // --- Surround Gain slider ---
-        CreateWindowW(L"STATIC", L"Surround:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
-        HWND sSlider = CreateWindowW(TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            ctrlX, y, ctrlW - 45, 25, hwnd,
-            reinterpret_cast<HMENU>(ID_SURROUND_SLIDER), hInst, nullptr);
-        SendMessageW(sSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-        SendMessageW(sSlider, TBM_SETPOS, TRUE, static_cast<int>(m_paramSurrGain * 100.0f));
-        char sBuf[16];
-        std::snprintf(sBuf, sizeof(sBuf), "%d%%", static_cast<int>(m_paramSurrGain * 100.0f));
-        CreateWindowA("STATIC", sBuf,
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            ctrlX + ctrlW - 40, y + 4, 40, 20, hwnd,
-            reinterpret_cast<HMENU>(ID_SURROUND_LABEL), hInst, nullptr);
 
         return 1;
     }
@@ -318,8 +269,6 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             switch (index) {
             case 0: std::strncpy(buf, "Mode",     kVstMaxParamStrLen); break;
             case 1: std::strncpy(buf, "Speakers", kVstMaxParamStrLen); break;
-            case 2: std::strncpy(buf, "Height",   kVstMaxParamStrLen); break;
-            case 3: std::strncpy(buf, "Surround", kVstMaxParamStrLen); break;
             }
         }
         return 0;
@@ -346,12 +295,6 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
                 else if (m_paramSpeakers < 0.75f) std::strncpy(buf, "7.1.2", kVstMaxParamStrLen);
                 else                              std::strncpy(buf, "7.1.4", kVstMaxParamStrLen);
                 break;
-            case 2:
-                std::snprintf(buf, kVstMaxParamStrLen, "%.0f%%", m_paramHeightGain * 100.0f);
-                break;
-            case 3:
-                std::snprintf(buf, kVstMaxParamStrLen, "%.0f%%", m_paramSurrGain * 100.0f);
-                break;
             }
         }
         return 0;
@@ -377,12 +320,6 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
     case 1:
         m_paramSpeakers = value;
         break;
-    case 2:
-        m_paramHeightGain = value;
-        break;
-    case 3:
-        m_paramSurrGain = value;
-        break;
     }
 }
 
@@ -390,8 +327,6 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     switch (index) {
     case 0: return m_paramMode;
     case 1: return m_paramSpeakers;
-    case 2: return m_paramHeightGain;
-    case 3: return m_paramSurrGain;
     default: return 0.0f;
     }
 }
@@ -456,6 +391,7 @@ void MagicSpatialVst::ZeroUnusedChannels(float** outputs, VstInt32 sampleFrames,
 void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32 sampleFrames) {
     if (sampleFrames <= 0) return;
 
+    // Detect input layout first — needed to decide spatial vs channel path
     InputLayout targetLayout;
     if (m_paramMode < 0.125f) {
         targetLayout = DetectLayoutFromInputs(inputs, sampleFrames);
@@ -471,6 +407,16 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
     }
     else {
         targetLayout = InputLayout::Passthrough;
+    }
+
+    // --- Spatial object mode (stereo only) ---
+    // For stereo input, use positioned 3D objects via ISpatialAudioClient.
+    // For 5.1/7.1/passthrough, fall through to the channel-based path so
+    // Dolby Access receives the original channels and can apply its own
+    // height synthesis.
+    if (m_spatialWriter.IsActive() && targetLayout == InputLayout::Stereo) {
+        ProcessSpatialObjects(inputs, outputs, sampleFrames);
+        return;
     }
 
     if (!m_engineInitialized || targetLayout != m_currentLayout) {
@@ -497,30 +443,7 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
         static_cast<uint32_t>(sampleFrames),
         outputs);
 
-    // Height channel fold-back: redirect energy not kept in heights back to
-    // the nearest bed channel. This ensures Dolby Access receives full-spectrum
-    // audio when Height Gain < 100%, rather than losing treble content.
-    //   TFL → FL,  TFR → FR,  TBL → SL,  TBR → SR
-    if (m_currentLayout != InputLayout::Passthrough) {
-        const float hGain = m_paramHeightGain;
-        const float foldBack = 1.0f - hGain;
-
-        for (VstInt32 i = 0; i < sampleFrames; ++i) {
-            outputs[CH_FL][i] += outputs[CH_TFL][i] * foldBack;
-            outputs[CH_TFL][i] *= hGain;
-
-            outputs[CH_FR][i] += outputs[CH_TFR][i] * foldBack;
-            outputs[CH_TFR][i] *= hGain;
-
-            outputs[CH_SL][i] += outputs[CH_TBL][i] * foldBack;
-            outputs[CH_TBL][i] *= hGain;
-
-            outputs[CH_SR][i] += outputs[CH_TBR][i] * foldBack;
-            outputs[CH_TBR][i] *= hGain;
-        }
-    }
-
-    // Zero channels with no physical speakers
+    // Zero channels with no physical speakers (fallback channel-based path)
     ZeroUnusedChannels(outputs, sampleFrames, SpeakerLayoutFromParam());
 }
 
@@ -553,6 +476,223 @@ void MagicSpatialVst::UpdateEngine() {
 
 void MagicSpatialVst::EditorRedraw() {
     // No longer needed — controls handle themselves
+}
+
+void MagicSpatialVst::InitSpatialDsp() {
+    if (m_spatialDspInitialized) return;
+
+    float sr = m_sampleRate;
+    uint32_t maxFrames = static_cast<uint32_t>(m_blockSize);
+
+    m_spatialSplitter.Initialize(sr, maxFrames);
+    m_spatialCorrelation.Initialize(sr);
+    m_spatialTransients.Initialize(sr);
+    m_spatialLfeLowpass.SetCoeffs(DesignLowpass(80.0f, sr));
+
+    const auto* presets = GetDecorrelatorPresets();
+    for (int i = 0; i < 8; ++i) {
+        m_spatialDecorr[i].Initialize(presets[i].coefficients, 3, presets[i].delaySamples);
+    }
+
+    // Pre-allocate all scratch buffers (#1: no heap allocation on audio thread)
+    for (int b = 0; b < 4; ++b) {
+        m_sBandL[b].resize(maxFrames);
+        m_sBandR[b].resize(maxFrames);
+    }
+    m_sMid0.resize(maxFrames); m_sMid1.resize(maxFrames); m_sMid2.resize(maxFrames);
+    m_sSide2.resize(maxFrames); m_sSide3.resize(maxFrames);
+    m_sFullMid.resize(maxFrames); m_sTransients.resize(maxFrames);
+    m_sScratch.resize(maxFrames);
+    m_sVocal.resize(maxFrames);
+    m_sSurrL.resize(maxFrames); m_sSurrR.resize(maxFrames);
+    m_sHeightL.resize(maxFrames); m_sHeightR.resize(maxFrames);
+    m_sAmbL.resize(maxFrames); m_sAmbR.resize(maxFrames);
+
+    m_spatialDspInitialized = true;
+}
+
+void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
+    InitSpatialDsp();
+
+    const float* L = inputs[0];
+    const float* R = inputs[1];
+    uint32_t frames = static_cast<uint32_t>(sampleFrames);
+
+    // --- Multiband split (using pre-allocated buffers) ---
+    float* bandL[4] = {m_sBandL[0].data(), m_sBandL[1].data(), m_sBandL[2].data(), m_sBandL[3].data()};
+    float* bandR[4] = {m_sBandR[0].data(), m_sBandR[1].data(), m_sBandR[2].data(), m_sBandR[3].data()};
+    m_spatialSplitter.Process(L, R, frames, bandL, bandR);
+
+    // Aliases for readability
+    float* bL0 = bandL[0]; float* bL1 = bandL[1]; float* bL2 = bandL[2]; float* bL3 = bandL[3];
+    float* bR0 = bandR[0]; float* bR1 = bandR[1]; float* bR2 = bandR[2]; float* bR3 = bandR[3];
+
+    // --- Per-band correlation ---
+    float corr[4];
+    for (int b = 0; b < 4; ++b) {
+        corr[b] = m_spatialCorrelation.ProcessBand(b, bandL[b], bandR[b], frames);
+    }
+
+    // (#5: Smooth surround weights across blocks for natural transitions)
+    float sw[4];
+    for (int b = 0; b < 4; ++b) {
+        float target = 1.0f - (corr[b] + 1.0f) * 0.5f;
+        m_smoothSW[b] += kSWSmoothing * (target - m_smoothSW[b]);
+        sw[b] = m_smoothSW[b];
+    }
+
+    // --- Transient detection ---
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sFullMid[i] = (L[i] + R[i]) * 0.5f;
+    }
+    m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
+
+    // --- Compute per-band mid/side ---
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sMid0[i]  = (bL0[i] + bR0[i]) * 0.5f;
+        m_sMid1[i]  = (bL1[i] + bR1[i]) * 0.5f;
+        m_sMid2[i]  = (bL2[i] + bR2[i]) * 0.5f;
+        m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f;
+        m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f;
+    }
+
+    // (#3: Dynamic position steering — compute L/R energy balance)
+    float energyL = 0.0f, energyR = 0.0f;
+    int step = std::max(1, sampleFrames / 64);
+    for (VstInt32 i = 0; i < sampleFrames; i += step) {
+        energyL += L[i] * L[i];
+        energyR += R[i] * R[i];
+    }
+    float totalEnergy = energyL + energyR + 1e-10f;
+    float balance = (energyR - energyL) / totalEnergy; // -1 = all left, +1 = all right
+
+    // Steer L/R object positions based on balance (subtle, ±0.15 shift)
+    float leftX  = -0.7f + balance * 0.15f;  // shifts right when R dominates
+    float rightX =  0.7f + balance * 0.15f;  // shifts right when R dominates
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_LEFT,  leftX,  0.0f, -0.5f);
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_RIGHT, rightX, 0.0f, -0.5f);
+
+    // Steer vocal slightly based on correlated content balance
+    float vocalBalance = 0.0f;
+    {
+        float vEnergyL = 0.0f, vEnergyR = 0.0f;
+        for (VstInt32 i = 0; i < sampleFrames; i += step) {
+            vEnergyL += bL1[i] * bL1[i];
+            vEnergyR += bR1[i] * bR1[i];
+        }
+        float vTotal = vEnergyL + vEnergyR + 1e-10f;
+        vocalBalance = (vEnergyR - vEnergyL) / vTotal;
+    }
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_VOCAL,
+        vocalBalance * 0.10f, 0.0f, -0.8f); // subtle ±0.1 horizontal shift
+
+    // --- OBJ_SUBBASS: sub-bass mid, lowpassed to 80Hz ---
+    m_spatialLfeLowpass.Process(m_sMid0.data(), m_sScratch.data(), frames);
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
+
+    // --- OBJ_VOCAL: centre-panned content across all mid bands ---
+    {
+        float cw1 = (corr[1] + 1.0f) * 0.5f;
+        float cw2 = (corr[2] + 1.0f) * 0.5f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tBoost = 1.0f + m_sTransients[i] * 0.3f;
+            m_sVocal[i] = m_sMid0[i] * 0.40f
+                        + m_sMid1[i] * 0.85f * cw1 * tBoost
+                        + m_sMid2[i] * 0.70f * cw2 * tBoost;
+        }
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, m_sVocal.data(), frames);
+    }
+
+    // --- OBJ_LEFT / OBJ_RIGHT: full original L/R (source-preserving) ---
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, L, frames);
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, R, frames);
+
+    // --- OBJ_SURR_LEFT/RIGHT: ambient content from all mid bands ---
+    {
+        std::memset(m_sSurrL.data(), 0, frames * sizeof(float));
+        std::memset(m_sSurrR.data(), 0, frames * sizeof(float));
+
+        // (#2: Low-mid ambient — room tone, reverb tails for envelopment)
+        {
+            for (uint32_t i = 0; i < frames; ++i) {
+                m_sAmbL[i] = (bL1[i] - m_sMid1[i]) * sw[1];
+                m_sAmbR[i] = (bR1[i] - m_sMid1[i]) * sw[1];
+            }
+            m_spatialDecorr[0].Process(m_sAmbL.data(), m_sScratch.data(), frames);
+            for (uint32_t i = 0; i < frames; ++i) {
+                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+                m_sSurrL[i] += m_sScratch[i] * 0.30f * tDuck;
+            }
+            m_spatialDecorr[1].Process(m_sAmbR.data(), m_sScratch.data(), frames);
+            for (uint32_t i = 0; i < frames; ++i) {
+                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+                m_sSurrR[i] += m_sScratch[i] * 0.30f * tDuck;
+            }
+        }
+
+        // High-mid side (transient-ducked)
+        m_spatialDecorr[2].Process(m_sSide2.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            m_sSurrL[i] += m_sScratch[i] * 0.50f * sw[2] * tDuck;
+        }
+        m_spatialDecorr[3].Process(m_sSide2.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            m_sSurrR[i] += m_sScratch[i] * 0.50f * sw[2] * tDuck;
+        }
+
+        // Treble side
+        for (uint32_t i = 0; i < frames; ++i) {
+            m_sSurrL[i] += m_sSide3[i] * 0.40f * sw[3];
+            m_sSurrR[i] -= m_sSide3[i] * 0.40f * sw[3]; // inverted for width
+        }
+
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_LEFT, m_sSurrL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_RIGHT, m_sSurrR.data(), frames);
+    }
+
+    // --- OBJ_HEIGHT_LEFT/RIGHT: ambient field extraction for overhead ---
+    {
+        std::memset(m_sHeightL.data(), 0, frames * sizeof(float));
+        std::memset(m_sHeightR.data(), 0, frames * sizeof(float));
+
+        // Low-mid ambient (body, warmth overhead)
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.7f;
+            m_sAmbL[i] = (bL1[i] - m_sMid1[i]) * sw[1] * tDuck;
+            m_sAmbR[i] = (bR1[i] - m_sMid1[i]) * sw[1] * tDuck;
+        }
+        m_spatialDecorr[4].Process(m_sAmbL.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) m_sHeightL[i] += m_sScratch[i] * 0.30f;
+        m_spatialDecorr[5].Process(m_sAmbR.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) m_sHeightR[i] += m_sScratch[i] * 0.30f;
+
+        // High-mid ambient (presence, spatial cues)
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.6f;
+            m_sAmbL[i] = (bL2[i] - m_sMid2[i]) * tDuck + bL2[i] * sw[2] * 0.3f;
+            m_sAmbR[i] = (bR2[i] - m_sMid2[i]) * tDuck + bR2[i] * sw[2] * 0.3f;
+        }
+        m_spatialDecorr[6].Process(m_sAmbL.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) m_sHeightL[i] += m_sScratch[i] * 0.45f;
+        m_spatialDecorr[7].Process(m_sAmbR.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) m_sHeightR[i] += m_sScratch[i] * 0.45f;
+
+        // Treble (HRTF high-shelf emphasis for overhead)
+        for (uint32_t i = 0; i < frames; ++i) {
+            m_sHeightL[i] += bL3[i] * 0.55f;
+            m_sHeightR[i] += bR3[i] * 0.55f;
+        }
+
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_LEFT, m_sHeightL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, m_sHeightR.data(), frames);
+    }
+
+    // Zero channel output — Dolby Access renders our objects instead
+    for (int ch = 0; ch < kAtmosChannelCount; ++ch) {
+        std::memset(outputs[ch], 0, sampleFrames * sizeof(float));
+    }
 }
 
 } // namespace MagicSpatial

@@ -1,36 +1,47 @@
 # MagicSpatial
 
-A VST2 plugin for [Equalizer APO](https://sourceforge.net/projects/equalizerapo/) that upmixes stereo, 5.1, and 7.1 audio to Dolby Atmos in real-time. It sits in the audio pipeline before Dolby Access, enriching flat audio sources with spatial content for your Atmos speaker system or headphones.
+A VST2 plugin for [Equalizer APO](https://sourceforge.net/projects/equalizerapo/) that upmixes stereo audio to Dolby Atmos using true spatial audio objects. For stereo sources, it decomposes the audio into positioned 3D objects via the Windows `ISpatialAudioClient` API, giving Dolby Access real object-based content to render. For 5.1 and 7.1 sources, it passes them through cleanly so Dolby Access can apply its own height synthesis.
 
-## What it does
+## How it works
 
-MagicSpatial intercepts audio on your Dolby Atmos output device and applies frequency-aware spatial processing:
+### Stereo sources (music, games, voice calls)
 
-- **Stereo sources** (music, games, voice calls) are analysed and expanded into a full surround bed using multiband frequency splitting, stereo correlation analysis, and transient detection
-- **5.1 sources** get back surround synthesis and optional height channel generation
-- **7.1 sources** get height channel synthesis
-- **Native Atmos content** is detected and passed through untouched
+MagicSpatial creates **8 positioned 3D audio objects** via `ISpatialAudioClient`, each carrying a different component of the stereo signal:
 
-### Enhanced spatial processing (stereo)
+| Object | Position | Content |
+|---|---|---|
+| **Sub-bass** | Centre, grounded | 80Hz lowpassed mid signal |
+| **Vocal** | Front centre | Correlated content across 3 frequency bands (sub-bass + low-mid + high-mid) |
+| **Left** | Front left | Full original left channel (source-preserving) |
+| **Right** | Front right | Full original right channel (source-preserving) |
+| **Surround L** | Behind left | Decorrelated ambient: low-mid room tone + high-mid + treble side |
+| **Surround R** | Behind right | Decorrelated ambient: low-mid room tone + high-mid + treble side |
+| **Height L** | Overhead left | Ambient extraction: diffuse content with HRTF high-shelf emphasis |
+| **Height R** | Overhead right | Ambient extraction: diffuse content with HRTF high-shelf emphasis |
 
-The stereo upmixer splits audio into four frequency bands and routes each one spatially based on its characteristics:
+The decomposition uses:
 
-| Frequency Band | Spatial Treatment |
-|---|---|
-| Sub-bass (< 200 Hz) | Anchored to centre + LFE |
-| Low-mid (200 Hz - 2 kHz) | Front stereo, vocals steered to centre via correlation analysis |
-| High-mid (2 - 8 kHz) | Front with transient emphasis, ambient content spread to surrounds |
-| Treble (> 8 kHz) | Distributed to sides and height channels for elevation |
+- **4-band frequency splitting** (Linkwitz-Riley crossovers at 200Hz, 2kHz, 8kHz) to route each frequency range to appropriate spatial positions
+- **Per-band stereo correlation analysis** to separate centre-panned content (vocals, dialogue) from ambient/decorrelated content (reverb, room tone)
+- **Transient detection** (dual envelope follower) to keep impacts focused in front objects and duck surround/height objects during transients
+- **Dynamic position steering** that subtly shifts L/R and vocal object positions based on the stereo energy balance, creating a living spatial image
+- **Ambient field extraction** for height objects based on the Dolby/DirAC principle: only diffuse, decorrelated content goes overhead, with treble emphasis matching natural HRTF perception of overhead sound
 
-**Transient detection** keeps impacts (gunshots, drum hits, footsteps) focused in the front channels while ducking surrounds, preserving clarity and directionality. This makes it suitable for gaming as well as music.
+Dolby Access receives these positioned objects and renders them to your actual speaker layout.
 
-**Stereo correlation analysis** detects how similar the left and right channels are in each frequency band. Correlated (centre-panned) content anchors to the front; decorrelated (ambient) content spreads to surrounds and heights.
+### 5.1 and 7.1 sources
+
+Passed through the channel-based path with minor enhancements (back surround synthesis for 5.1). Dolby Access applies its own height synthesis from the surround bed, which works well for multichannel content that already has intentional spatial positioning.
+
+### Native Atmos content
+
+Applications using the Windows Spatial Audio API (`ISpatialAudioClient`) bypass E-APO entirely. In Auto mode, MagicSpatial also detects 7.1.4 content (signal on height channels) and passes it through untouched.
 
 ## Requirements
 
 - Windows 10/11
 - [Equalizer APO](https://sourceforge.net/projects/equalizerapo/) installed on your Atmos output device
-- [Dolby Access](https://www.microsoft.com/store/productId/9N0866FS04W8) set as the Spatial Sound provider on the same device (for speaker setups), or Windows Sonic / Dolby Atmos for Headphones (for headphone setups)
+- [Dolby Access](https://www.microsoft.com/store/productId/9N0866FS04W8) set as the Spatial Sound provider ("Dolby Atmos for Home Theater")
 
 ## Installation
 
@@ -39,7 +50,7 @@ The stereo upmixer splits audio into four frequency bands and routes each one sp
 3. Open **Equalizer APO Configuration Editor**
 4. Add a new filter and select **VST Plugin**
 5. Browse to `MagicSpatial.dll`
-6. The plugin will load with default settings (Auto mode, 5.1.2 speakers)
+6. The plugin will load and automatically activate spatial audio objects
 
 ### E-APO config.txt (manual setup)
 
@@ -50,30 +61,25 @@ VSTPlugin: Library "C:\Program Files\EqualizerAPO\VSTPlugins\MagicSpatial.dll"
 
 ## Parameters
 
-Open the plugin panel in E-APO's configurator to access these controls:
+Open the plugin panel in E-APO's configurator:
 
 | Parameter | Options | Default | Description |
 |---|---|---|---|
 | **Mode** | Auto, Stereo, 5.1, 7.1, Passthrough | Auto | Input format. Auto detects from channel activity. |
-| **Speakers** | 2.0 (Headphones), 5.1.2, 5.1.4, 7.1.2, 7.1.4 | 5.1.2 | Your physical speaker layout. Channels without speakers are zeroed. |
-| **Height** | 0 - 100% | 0% | Height channel synthesis level. At 0%, Dolby Access generates its own heights. |
-| **Surround** | 0 - 100% | 70% | Surround synthesis intensity for the stereo upmixer. |
+| **Speakers** | 2.0 (Headphones), 5.1.2, 5.1.4, 7.1.2, 7.1.4 | 5.1.2 | Your physical speaker layout (used for the channel-based fallback path). |
 
-### Speaker layout details
+### How the two paths work
 
-- **2.0 (Headphones)** -- All spatial channels are folded down into left/right with appropriate mixing. The enhanced spatial processing still enriches the stereo image.
-- **5.1.2** -- Front L/R, Centre, LFE, Surround L/R, 2 height speakers. Back surrounds and rear heights are zeroed.
-- **5.1.4** -- As above but with 4 height speakers. Back surrounds still zeroed.
-- **7.1.2** -- Full 7.1 bed with 2 height speakers. Rear heights zeroed.
-- **7.1.4** -- All 12 channels active.
-
-### Height gain and Dolby Access
-
-When **Height** is set to 0% (default), the height output channels are silent. Dolby Access will then apply its own height virtualisation, which is specifically tuned for Atmos rendering. If you prefer MagicSpatial's height synthesis instead, increase the Height parameter -- Dolby Access should detect the populated height channels and pass them through.
+| Input | Processing Path | Output Method |
+|---|---|---|
+| **Stereo** | Multiband decomposition into 8 spatial objects | `ISpatialAudioClient` dynamic objects to Dolby Access |
+| **5.1** | Channel passthrough + back surround synthesis | E-APO channels to Dolby Access (Dolby adds heights) |
+| **7.1** | Channel passthrough | E-APO channels to Dolby Access (Dolby adds heights) |
+| **7.1.4 / Atmos** | Passthrough | E-APO channels (untouched) |
 
 ### Atmos passthrough
 
-In **Auto** mode, MagicSpatial detects existing Atmos content (signal present on height channels 8-11) and switches to passthrough, leaving the audio untouched. Applications that use the Windows Spatial Audio API (`ISpatialAudioClient`) bypass E-APO entirely, so native Atmos games and apps are never affected regardless of settings.
+In **Auto** mode, MagicSpatial detects existing Atmos content (signal present on height channels 8-11) and switches to passthrough, leaving the audio untouched. Applications using `ISpatialAudioClient` natively bypass E-APO entirely.
 
 ## Building
 
@@ -92,10 +98,15 @@ No external dependencies -- the plugin uses only the Windows SDK and a minimal s
 src/
   vst/                          -- VST2 plugin shell
     VstDefs.h                   -- Minimal VST2 type definitions
-    MagicSpatialVst.h/.cpp      -- Plugin class, parameters, Win32 editor UI
+    MagicSpatialVst.h/.cpp      -- Plugin class, parameters, Win32 editor UI,
+                                   spatial object decomposition
     VstEntry.cpp                -- DLL entry point (VSTPluginMain)
-  processing/                   -- DSP engine (platform-independent)
-    EnhancedStereoUpmixer.*     -- Multiband spatial stereo upmixer
+  audio/                        -- Spatial audio output
+    SpatialObjectWriter.h/.cpp  -- ISpatialAudioClient wrapper: activates spatial
+                                   audio via IMMDevice::Activate, manages dynamic
+                                   objects, background render thread
+  processing/                   -- DSP engine
+    EnhancedStereoUpmixer.*     -- Multiband spatial stereo upmixer (channel-based fallback)
     MultibandSplitter.*         -- LR4 crossover filter bank (4 bands)
     TransientDetector.*         -- Dual envelope follower
     StereoCorrelationAnalyzer.* -- Per-band L/R correlation
@@ -107,11 +118,23 @@ src/
     ChannelLayout.h             -- Input format enum
   core/
     Types.h                     -- 7.1.4 channel constants
+    Log.h                       -- File logger (%APPDATA%\MagicSpatial\spatial.log)
 ```
+
+### Key technical details
+
+- **Spatial audio activation**: Uses `IMMDevice::Activate` for `ISpatialAudioClient` (the async `ActivateAudioInterfaceAsync` path does not work with Dolby Atmos for Home Theater)
+- **Background render thread**: A dedicated MTA COM thread handles the spatial audio render loop, receiving decomposed audio from the VST audio thread via lock-free exchange buffers
+- **Stream recovery**: If the spatial audio stream is temporarily unavailable (e.g. after E-APO reloads the plugin), retries up to 100 times with 200ms intervals
+- **Fallback**: If spatial audio activation fails entirely, the plugin falls back to the channel-based `EnhancedStereoUpmixer` path automatically
 
 ## Latency
 
-The plugin adds no measurable latency. All processing uses IIR biquad filters and envelope followers which produce output on the same sample as input. The only delay is from the decorrelator pre-delays (max 37 samples = 0.77 ms at 48 kHz), which is imperceptible and identical across all modes.
+The plugin adds no measurable latency. All processing uses IIR biquad filters and envelope followers which produce output on the same sample as input. The only delay is from the decorrelator pre-delays (max 37 samples = 0.77 ms at 48 kHz), which is imperceptible. The spatial audio render thread adds one buffer cycle (~10ms) but this is handled asynchronously and does not block the audio pipeline.
+
+## Log file
+
+Diagnostic output is written to `%APPDATA%\MagicSpatial\spatial.log`. This includes spatial audio activation status, object count, and any errors.
 
 ## License
 
