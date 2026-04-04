@@ -534,11 +534,13 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
 
     // (#5: Smooth surround weights across blocks for natural transitions)
+    // Squared for steeper vocal rejection: when correlation is high (vocals),
+    // sw drops much faster. e.g. corr=0.5 → linear sw=0.25, squared sw=0.06
     float sw[4];
     for (int b = 0; b < 4; ++b) {
         float target = 1.0f - (corr[b] + 1.0f) * 0.5f;
         m_smoothSW[b] += kSWSmoothing * (target - m_smoothSW[b]);
-        sw[b] = m_smoothSW[b];
+        sw[b] = m_smoothSW[b] * m_smoothSW[b]; // squared for aggressive gating
     }
 
     // --- Transient detection ---
@@ -586,8 +588,14 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_VOCAL,
         vocalBalance * 0.10f, 0.0f, -0.8f); // subtle ±0.1 horizontal shift
 
-    // --- OBJ_SUBBASS: sub-bass mid, lowpassed to 80Hz ---
-    m_spatialLfeLowpass.Process(m_sMid0.data(), m_sScratch.data(), frames);
+    // --- OBJ_SUBBASS: full sub-bass band (<200Hz) + low-mid bass (200-400Hz) ---
+    // Send the full sub-bass band without extra lowpass, plus some low-mid
+    // content for warmth. This ensures the subwoofer gets proper 40-200Hz+ signal
+    // rather than just the ultra-low content below 80Hz.
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sScratch[i] = m_sMid0[i] * 0.70f        // full sub-bass band (<200Hz)
+                       + m_sMid1[i] * 0.30f;        // low-mid body (200Hz-2kHz) for warmth
+    }
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
     // --- OBJ_VOCAL: centre-panned content across all mid bands ---
@@ -652,38 +660,37 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_RIGHT, m_sSurrR.data(), frames);
     }
 
-    // --- OBJ_HEIGHT_LEFT/RIGHT: ambient field extraction for overhead ---
+    // --- OBJ_HEIGHT_LEFT/RIGHT: ambient overhead ---
+    // Full-bandwidth side signal (good mid-range energy), single decorrelator
+    // pass (no cascading — avoids comb filtering buzz). Per-band correlation
+    // reduces vocal-heavy content: bands with high correlation (vocals) are
+    // attenuated, bands with low correlation (ambient) pass through.
     {
-        std::memset(m_sHeightL.data(), 0, frames * sizeof(float));
-        std::memset(m_sHeightR.data(), 0, frames * sizeof(float));
-
-        // Low-mid ambient (body, warmth overhead)
+        // Build height feed per-band, weighted by ambient content (1 - correlation).
+        // Low-mid (200-2kHz): heavily vocal, reduce based on correlation
+        // High-mid (2-8kHz): presence, less vocal, moderate reduction
+        // Treble (>8kHz): mostly ambient, pass freely
         for (uint32_t i = 0; i < frames; ++i) {
-            float tDuck = 1.0f - m_sTransients[i] * 0.7f;
-            m_sAmbL[i] = (bL1[i] - m_sMid1[i]) * sw[1] * tDuck;
-            m_sAmbR[i] = (bR1[i] - m_sMid1[i]) * sw[1] * tDuck;
-        }
-        m_spatialDecorr[4].Process(m_sAmbL.data(), m_sScratch.data(), frames);
-        for (uint32_t i = 0; i < frames; ++i) m_sHeightL[i] += m_sScratch[i] * 0.30f;
-        m_spatialDecorr[5].Process(m_sAmbR.data(), m_sScratch.data(), frames);
-        for (uint32_t i = 0; i < frames; ++i) m_sHeightR[i] += m_sScratch[i] * 0.30f;
+            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
 
-        // High-mid ambient (presence, spatial cues)
-        for (uint32_t i = 0; i < frames; ++i) {
-            float tDuck = 1.0f - m_sTransients[i] * 0.6f;
-            m_sAmbL[i] = (bL2[i] - m_sMid2[i]) * tDuck + bL2[i] * sw[2] * 0.3f;
-            m_sAmbR[i] = (bR2[i] - m_sMid2[i]) * tDuck + bR2[i] * sw[2] * 0.3f;
-        }
-        m_spatialDecorr[6].Process(m_sAmbL.data(), m_sScratch.data(), frames);
-        for (uint32_t i = 0; i < frames; ++i) m_sHeightL[i] += m_sScratch[i] * 0.45f;
-        m_spatialDecorr[7].Process(m_sAmbR.data(), m_sScratch.data(), frames);
-        for (uint32_t i = 0; i < frames; ++i) m_sHeightR[i] += m_sScratch[i] * 0.45f;
+            // Low-mid: only the ambient (side) portion, scaled down by correlation
+            float side1 = (bL1[i] - bR1[i]) * 0.5f;
+            // High-mid: side signal, less aggressive correlation scaling
+            float side2L = bL2[i] - m_sMid2[i];
+            float side2R = bR2[i] - m_sMid2[i];
 
-        // Treble (HRTF high-shelf emphasis for overhead)
-        for (uint32_t i = 0; i < frames; ++i) {
-            m_sHeightL[i] += bL3[i] * 0.55f;
-            m_sHeightR[i] += bR3[i] * 0.55f;
+            m_sAmbL[i] = (side1 * 0.40f * sw[1]          // low-mid ambient (warmth for mid cones)
+                       +  side2L * 0.50f                    // high-mid side (presence)
+                       +  bL3[i] * 0.35f) * tDuck;         // treble (HRTF)
+
+            m_sAmbR[i] = (-side1 * 0.40f * sw[1]          // inverted for width
+                       +  side2R * 0.50f
+                       +  bR3[i] * 0.35f) * tDuck;
         }
+
+        // Single decorrelator pass — clean diffusion without comb filtering
+        m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
+        m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
 
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_LEFT, m_sHeightL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, m_sHeightR.data(), frames);
