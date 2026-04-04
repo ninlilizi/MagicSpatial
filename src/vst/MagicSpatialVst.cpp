@@ -497,14 +497,26 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
         static_cast<uint32_t>(sampleFrames),
         outputs);
 
-    // Scale synthesized heights by Height Gain parameter
+    // Height channel fold-back: redirect energy not kept in heights back to
+    // the nearest bed channel. This ensures Dolby Access receives full-spectrum
+    // audio when Height Gain < 100%, rather than losing treble content.
+    //   TFL → FL,  TFR → FR,  TBL → SL,  TBR → SR
     if (m_currentLayout != InputLayout::Passthrough) {
         const float hGain = m_paramHeightGain;
-        for (int ch = CH_TFL; ch <= CH_TBR; ++ch) {
-            float* buf = outputs[ch];
-            for (VstInt32 i = 0; i < sampleFrames; ++i) {
-                buf[i] *= hGain;
-            }
+        const float foldBack = 1.0f - hGain;
+
+        for (VstInt32 i = 0; i < sampleFrames; ++i) {
+            outputs[CH_FL][i] += outputs[CH_TFL][i] * foldBack;
+            outputs[CH_TFL][i] *= hGain;
+
+            outputs[CH_FR][i] += outputs[CH_TFR][i] * foldBack;
+            outputs[CH_TFR][i] *= hGain;
+
+            outputs[CH_SL][i] += outputs[CH_TBL][i] * foldBack;
+            outputs[CH_TBL][i] *= hGain;
+
+            outputs[CH_SR][i] += outputs[CH_TBR][i] * foldBack;
+            outputs[CH_TBR][i] *= hGain;
         }
     }
 
