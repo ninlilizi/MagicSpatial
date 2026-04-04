@@ -47,8 +47,13 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
     const float* L = input[0];
     const float* R = input[1];
 
-    // Zero all output channels
-    for (int ch = 0; ch < kAtmosChannelCount; ++ch) {
+    // Front L/R: pass through the original source UNCHANGED.
+    // All other channels are purely additive — we never subtract from the source.
+    std::memcpy(output[CH_FL], L, frameCount * sizeof(float));
+    std::memcpy(output[CH_FR], R, frameCount * sizeof(float));
+
+    // Zero the synthesized channels (C, LFE, surrounds, heights)
+    for (int ch = CH_C; ch < kAtmosChannelCount; ++ch) {
         std::memset(output[ch], 0, frameCount * sizeof(float));
     }
 
@@ -74,43 +79,33 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
     }
 
     // Derive routing weights from correlation
-    // corrNorm: 0 = anti-correlated (pure side), 1 = correlated (center)
-    float centerWeight[MultibandSplitter::kNumBands];
     float surroundWeight[MultibandSplitter::kNumBands];
     for (int b = 0; b < MultibandSplitter::kNumBands; ++b) {
-        float cn = (corr[b] + 1.0f) * 0.5f; // map [-1,+1] to [0,1]
-        centerWeight[b] = cn;
+        float cn = (corr[b] + 1.0f) * 0.5f;
         surroundWeight[b] = 1.0f - cn;
     }
 
     // ========== Band 0: Sub-bass (< 200Hz) ==========
+    // Synthesize Center and LFE. Front L/R already have the full source.
     {
-        // Mid/Side
         for (uint32_t i = 0; i < frameCount; ++i) {
             m_bandMid[i] = (bL[0][i] + bR[0][i]) * 0.5f;
         }
 
-        // Center: sub-bass mid
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_C][i] += m_bandMid[i] * kSubCenterGain;
         }
 
-        // LFE: lowpassed sub-bass mid
         m_lfeLowpass.Process(m_bandMid.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_LFE][i] += m_decorrScratch[i] * kSubLfeGain;
         }
-
-        // Front L/R: residual after center extraction
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            output[CH_FL][i] += bL[0][i] - m_bandMid[i] * kSubCenterGain * 0.5f;
-            output[CH_FR][i] += bR[0][i] - m_bandMid[i] * kSubCenterGain * 0.5f;
-        }
     }
 
     // ========== Band 1: Low-mid (200Hz - 2kHz) ==========
+    // Synthesize Center and Surrounds. Front L/R untouched.
     {
-        float cw = centerWeight[1];
+        float cw = (corr[1] + 1.0f) * 0.5f;
         float sw = surroundWeight[1];
 
         for (uint32_t i = 0; i < frameCount; ++i) {
@@ -118,20 +113,11 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             m_bandSide[i] = (bL[1][i] - bR[1][i]) * 0.5f;
         }
 
-        // Center: correlation-weighted mid with transient boost
         for (uint32_t i = 0; i < frameCount; ++i) {
             float tBoost = 1.0f + m_transients[i] * 0.3f;
             output[CH_C][i] += m_bandMid[i] * kLowMidCenterGain * cw * tBoost;
         }
 
-        // Front L/R: direct content minus center bleed
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            float centerSub = m_bandMid[i] * kLowMidCenterGain * cw * 0.5f;
-            output[CH_FL][i] += bL[1][i] * kLowMidFrontGain - centerSub;
-            output[CH_FR][i] += bR[1][i] * kLowMidFrontGain - centerSub;
-        }
-
-        // Surrounds: decorrelated side, surround-weighted
         m_band1Decorr[0].Process(m_bandSide.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_SL][i] += m_decorrScratch[i] * kLowMidSurrGain * sw;
@@ -143,6 +129,7 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
     }
 
     // ========== Band 2: High-mid (2kHz - 8kHz) ==========
+    // Synthesize Surrounds, Backs, Heights. Front L/R untouched.
     {
         float sw = surroundWeight[2];
 
@@ -150,14 +137,6 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             m_bandSide[i] = (bL[2][i] - bR[2][i]) * 0.5f;
         }
 
-        // Front L/R: transient-boosted
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            float tBoost = 1.0f + m_transients[i] * 0.4f;
-            output[CH_FL][i] += bL[2][i] * kHighMidFrontGain * tBoost;
-            output[CH_FR][i] += bR[2][i] * kHighMidFrontGain * tBoost;
-        }
-
-        // Side surrounds: transient-ducked
         m_band2Decorr[0].Process(m_bandSide.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             float tDuck = 1.0f - m_transients[i] * 0.5f;
@@ -169,7 +148,6 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             output[CH_SR][i] += m_decorrScratch[i] * kHighMidSurrGain * sw * tDuck;
         }
 
-        // Back surrounds
         m_band2Decorr[2].Process(m_bandSide.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_BL][i] += m_decorrScratch[i] * kHighMidBackGain * sw;
@@ -179,7 +157,6 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             output[CH_BR][i] += m_decorrScratch[i] * kHighMidBackGain * sw;
         }
 
-        // Heights: decorrelated L/R (not just side), surround-weighted
         m_band2Decorr[4].Process(bL[2], m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_TFL][i] += m_decorrScratch[i] * kHighMidHeightGain * sw;
@@ -199,6 +176,7 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
     }
 
     // ========== Band 3: Treble (> 8kHz) ==========
+    // Synthesize Sides and Heights. Front L/R untouched.
     {
         float sw = surroundWeight[3];
 
@@ -206,13 +184,6 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             m_bandSide[i] = (bL[3][i] - bR[3][i]) * 0.5f;
         }
 
-        // Front L/R: reduced presence (treble mainly goes to sides/heights)
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            output[CH_FL][i] += bL[3][i] * kTrebleFrontGain;
-            output[CH_FR][i] += bR[3][i] * kTrebleFrontGain;
-        }
-
-        // Sides
         m_band3Decorr[0].Process(m_bandSide.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_SL][i] += m_decorrScratch[i] * kTrebleSideGain * sw;
@@ -222,7 +193,6 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             output[CH_SR][i] += m_decorrScratch[i] * kTrebleSideGain * sw;
         }
 
-        // Heights: decorrelated band L/R — treble naturally elevates
         m_band3Decorr[2].Process(bL[3], m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_TFL][i] += m_decorrScratch[i] * kTrebleHeightGain;
@@ -239,6 +209,14 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_TBR][i] += m_decorrScratch[i] * kTrebleBackHeightGain;
         }
+    }
+
+    // Centre channel exception: subtract centre content from FL/FR so that
+    // vocals/dialogue anchor to the physical centre speaker rather than
+    // doubling as both phantom centre (in L/R) and discrete centre.
+    for (uint32_t i = 0; i < frameCount; ++i) {
+        output[CH_FL][i] -= output[CH_C][i] * 0.5f;
+        output[CH_FR][i] -= output[CH_C][i] * 0.5f;
     }
 }
 
