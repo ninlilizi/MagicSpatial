@@ -12,6 +12,7 @@
 
 namespace MagicSpatial {
 
+
 // --- Editor control IDs ---
 enum EditorCtrlID {
     ID_MODE_COMBO     = 1001,
@@ -32,15 +33,14 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         if (HIWORD(wParam) == CBN_SELCHANGE) {
             int id = LOWORD(wParam);
             int sel = static_cast<int>(SendMessageW(reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0));
+            // All combos set members directly — calling SetParameter triggers
+            // E-APO to reload the plugin, killing the spatial audio stream.
             if (id == ID_MODE_COMBO) {
-                // Map combo index to param: 0=Auto(0.0), 1=Stereo(0.25), 2=5.1(0.5), 3=7.1(0.75), 4=Pass(1.0)
-                float val = static_cast<float>(sel) * 0.25f;
-                plugin->SetParameter(0, val);
+                plugin->m_paramMode = static_cast<float>(sel) * 0.25f;
+                plugin->m_engineInitialized = false;
             }
             else if (id == ID_SPEAKERS_COMBO) {
-                // Map: 0=2.0(0.0), 1=5.1.2(0.25), 2=5.1.4(0.45), 3=7.1.2(0.65), 4=7.1.4(1.0)
-                float val = (sel == 0) ? 0.0f : (sel == 1) ? 0.25f : (sel == 2) ? 0.45f : (sel == 3) ? 0.65f : 1.0f;
-                plugin->SetParameter(1, val);
+                plugin->m_paramSpeakers = (sel == 0) ? 0.0f : (sel == 1) ? 0.25f : (sel == 2) ? 0.45f : (sel == 3) ? 0.65f : 1.0f;
             }
         }
         return 0;
@@ -131,11 +131,10 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             m_spatialWriter.Initialize();
             LogMsg("effOpen: SpatialObjectWriter Initialize called\n");
         }
+
         return 0;
 
     case effClose:
-        // Shut down spatial audio BEFORE destruction to ensure resources
-        // are fully released before E-APO creates a new plugin instance.
         m_spatialWriter.Shutdown();
         delete this;
         return 0;
@@ -409,13 +408,21 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
         targetLayout = InputLayout::Passthrough;
     }
 
-    // --- Spatial object mode (stereo only) ---
-    // For stereo input, use positioned 3D objects via ISpatialAudioClient.
-    // For 5.1/7.1/passthrough, fall through to the channel-based path so
-    // Dolby Access receives the original channels and can apply its own
-    // height synthesis.
-    if (m_spatialWriter.IsActive() && targetLayout == InputLayout::Stereo) {
+    // --- Spatial object mode ---
+    // Always enter the spatial path for Auto/Stereo mode. Submit audio to the
+    // spatial writer even while it's still activating (it buffers safely).
+    // Only zero channel output once the writer is confirmed active.
+    if (m_paramMode < 0.125f || m_paramMode < 0.375f) { // Auto or Stereo
         ProcessSpatialObjects(inputs, outputs, sampleFrames);
+
+        if (m_spatialWriter.IsActive()) {
+            // Spatial objects are rendering — zero channel output to avoid double playback
+            for (int ch = 0; ch < kAtmosChannelCount; ++ch) {
+                std::memset(outputs[ch], 0, sampleFrames * sizeof(float));
+            }
+        }
+        // If writer isn't active yet, channel output from ProcessSpatialObjects
+        // provides audio through E-APO's normal path as fallback.
         return;
     }
 
@@ -455,7 +462,9 @@ InputLayout MagicSpatialVst::DetectLayoutFromInputs(float** inputs, VstInt32 sam
         for (VstInt32 i = 0; i < sampleFrames; i += step) {
             energy += inputs[channel][i] * inputs[channel][i];
         }
-        return energy > 1e-10f;
+        // Threshold must be well above E-APO residual noise on unused channels.
+        // 1e-4 ≈ -40 dBFS — real audio signals are far above this.
+        return energy > 1e-4f;
     };
 
     if (hasSignal(8) || hasSignal(9) || hasSignal(10) || hasSignal(11)) {
@@ -518,6 +527,7 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     const float* R = inputs[1];
     uint32_t frames = static_cast<uint32_t>(sampleFrames);
 
+    // --- DSP mode: multiband decomposition ---
     // --- Multiband split (using pre-allocated buffers) ---
     float* bandL[4] = {m_sBandL[0].data(), m_sBandL[1].data(), m_sBandL[2].data(), m_sBandL[3].data()};
     float* bandR[4] = {m_sBandR[0].data(), m_sBandR[1].data(), m_sBandR[2].data(), m_sBandR[3].data()};
@@ -660,35 +670,19 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_RIGHT, m_sSurrR.data(), frames);
     }
 
-    // --- OBJ_HEIGHT_LEFT/RIGHT: ambient overhead ---
-    // Full-bandwidth side signal (good mid-range energy), single decorrelator
-    // pass (no cascading — avoids comb filtering buzz). Per-band correlation
-    // reduces vocal-heavy content: bands with high correlation (vocals) are
-    // attenuated, bands with low correlation (ambient) pass through.
+    // --- OBJ_HEIGHT_LEFT/RIGHT: full-bandwidth ambient overhead ---
+    // Full L/R with centre removed, transient-ducked, then decorrelated.
+    // No frequency band exclusions — all bands contribute for full-range
+    // speaker output (tweeters AND mid-range cones).
     {
-        // Build height feed per-band, weighted by ambient content (1 - correlation).
-        // Low-mid (200-2kHz): heavily vocal, reduce based on correlation
-        // High-mid (2-8kHz): presence, less vocal, moderate reduction
-        // Treble (>8kHz): mostly ambient, pass freely
         for (uint32_t i = 0; i < frames; ++i) {
+            float mid = (L[i] + R[i]) * 0.5f;
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-
-            // Low-mid: only the ambient (side) portion, scaled down by correlation
-            float side1 = (bL1[i] - bR1[i]) * 0.5f;
-            // High-mid: side signal, less aggressive correlation scaling
-            float side2L = bL2[i] - m_sMid2[i];
-            float side2R = bR2[i] - m_sMid2[i];
-
-            m_sAmbL[i] = (side1 * 0.40f * sw[1]          // low-mid ambient (warmth for mid cones)
-                       +  side2L * 0.50f                    // high-mid side (presence)
-                       +  bL3[i] * 0.35f) * tDuck;         // treble (HRTF)
-
-            m_sAmbR[i] = (-side1 * 0.40f * sw[1]          // inverted for width
-                       +  side2R * 0.50f
-                       +  bR3[i] * 0.35f) * tDuck;
+            m_sAmbL[i] = (L[i] - mid) * 0.45f * tDuck;
+            m_sAmbR[i] = (R[i] - mid) * 0.45f * tDuck;
         }
 
-        // Single decorrelator pass — clean diffusion without comb filtering
+        // Single decorrelator pass for diffusion
         m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
         m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
 
@@ -696,8 +690,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, m_sHeightR.data(), frames);
     }
 
-    // Zero channel output — Dolby Access renders our objects instead
-    for (int ch = 0; ch < kAtmosChannelCount; ++ch) {
+    // Write original L/R to channel outputs as fallback. The caller
+    // (ProcessReplacing) will zero these if the spatial writer is active.
+    std::memcpy(outputs[CH_FL], L, sampleFrames * sizeof(float));
+    std::memcpy(outputs[CH_FR], R, sampleFrames * sizeof(float));
+    for (int ch = CH_C; ch < kAtmosChannelCount; ++ch) {
         std::memset(outputs[ch], 0, sampleFrames * sizeof(float));
     }
 }

@@ -17,7 +17,7 @@ inline FILE* GetLogFile() {
             std::wstring dir = std::wstring(appdata) + L"\\MagicSpatial";
             CreateDirectoryW(dir.c_str(), nullptr);
             std::wstring path = dir + L"\\spatial.log";
-            s_file = _wfopen(path.c_str(), L"w");
+            s_file = _wfopen(path.c_str(), L"a");
         }
     }
     return s_file;

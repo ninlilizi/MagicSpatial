@@ -70,6 +70,7 @@
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ole32.lib;mmdevapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -88,6 +89,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ole32.lib;mmdevapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -110,6 +112,9 @@
   <!-- Header Files -->
   <ItemGroup>
     <ClInclude Include="src\core\Types.h" />
+    <ClInclude Include="src\core\Log.h" />
+    <ClInclude Include="src\audio\SpatialObjectWriter.h" />
+    <ClCompile Include="src\audio\SpatialObjectWriter.cpp" />
     <ClInclude Include="src\vst\VstDefs.h" />
     <ClInclude Include="src\vst\MagicSpatialVst.h" />
     <ClInclude Include="src\processing\ChannelLayout.h" />

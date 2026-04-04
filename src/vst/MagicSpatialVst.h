@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+#include <string>
 #include "vst/VstDefs.h"
 #include "processing/UpmixEngine.h"
 #include "processing/ChannelLayout.h"
@@ -28,9 +30,7 @@ enum class SpeakerLayout {
 //
 // Parameters:
 //   0 - Mode:     Auto / Stereo / 5.1 / 7.1 / Passthrough
-//   1 - Speakers:  5.1.2 / 5.1.4 / 7.1.2 / 7.1.4
-//   2 - Height Gain:  0-100% (0% = let Dolby Access synthesize)
-//   3 - Surround Gain: 0-100% (scales synthesized surround channels)
+//   1 - Speakers:  2.0 / 5.1.2 / 5.1.4 / 7.1.2 / 7.1.4
 class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
@@ -38,6 +38,10 @@ public:
     static constexpr int kNumParams  = 2;
 
     static constexpr VstInt32 kUniqueID = 'MgSp';
+
+    // EditorWndProc needs direct member access to avoid SetParameter
+    // (which causes E-APO to reload the plugin)
+    friend LRESULT CALLBACK EditorWndProc(HWND, UINT, WPARAM, LPARAM);
 
     MagicSpatialVst(audioMasterCallback hostCallback);
 
@@ -59,7 +63,7 @@ private:
     audioMasterCallback m_hostCallback;
 
     // Editor
-    ERect m_editorRect{0, 0, 120, 340};
+    ERect m_editorRect{0, 0, 190, 340};
     void* m_editorHwnd = nullptr;  // HWND of our child window
 
     // Parameters
