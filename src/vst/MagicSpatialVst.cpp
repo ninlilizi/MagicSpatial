@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #pragma comment(lib, "comctl32.lib")
@@ -493,6 +494,7 @@ void MagicSpatialVst::InitSpatialDsp() {
     float sr = m_sampleRate;
     uint32_t maxFrames = static_cast<uint32_t>(m_blockSize);
 
+    m_spatialSeparator.Initialize(sr, maxFrames);
     m_spatialSplitter.Initialize(sr, maxFrames);
     m_spatialCorrelation.Initialize(sr);
     m_spatialTransients.Initialize(sr);
@@ -508,14 +510,15 @@ void MagicSpatialVst::InitSpatialDsp() {
         m_sBandL[b].resize(maxFrames);
         m_sBandR[b].resize(maxFrames);
     }
-    m_sMid0.resize(maxFrames); m_sMid1.resize(maxFrames); m_sMid2.resize(maxFrames);
     m_sSide2.resize(maxFrames); m_sSide3.resize(maxFrames);
     m_sFullMid.resize(maxFrames); m_sTransients.resize(maxFrames);
     m_sScratch.resize(maxFrames);
-    m_sVocal.resize(maxFrames);
     m_sSurrL.resize(maxFrames); m_sSurrR.resize(maxFrames);
     m_sHeightL.resize(maxFrames); m_sHeightR.resize(maxFrames);
     m_sAmbL.resize(maxFrames); m_sAmbR.resize(maxFrames);
+    m_sDelayedL.resize(maxFrames); m_sDelayedR.resize(maxFrames);
+    m_sCenter.resize(maxFrames);
+    m_sResidualL.resize(maxFrames); m_sResidualR.resize(maxFrames);
 
     m_spatialDspInitialized = true;
 }
@@ -523,19 +526,38 @@ void MagicSpatialVst::InitSpatialDsp() {
 void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
     InitSpatialDsp();
 
-    const float* L = inputs[0];
-    const float* R = inputs[1];
+    const float* inL = inputs[0];
+    const float* inR = inputs[1];
     uint32_t frames = static_cast<uint32_t>(sampleFrames);
 
-    // --- DSP mode: multiband decomposition ---
-    // --- Multiband split (using pre-allocated buffers) ---
+    // --- Step 0: Frequency-domain separation ---
+    // Per-bin phase/amplitude mask peels the phantom centre cleanly out of the
+    // stereo field without touching overlapping neighbour frequencies. All
+    // downstream analysis runs on the delayed signals so nothing desyncs.
+    m_spatialSeparator.Process(inL, inR, frames,
+                               m_sDelayedL.data(), m_sDelayedR.data(), m_sCenter.data());
+    const float* L = m_sDelayedL.data();
+    const float* R = m_sDelayedR.data();
+    const float* C = m_sCenter.data();
+
+    // --- Residuals = delayed L/R minus spectral centre ---
+    // Every surround/height/front-L-R feed draws from these so vocals never
+    // leak into anything but OBJ_VOCAL (and a little into the sub below).
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sResidualL[i] = L[i] - C[i];
+        m_sResidualR[i] = R[i] - C[i];
+    }
+    const float* rL = m_sResidualL.data();
+    const float* rR = m_sResidualR.data();
+
+    // --- Multiband split on RESIDUALS ---
     float* bandL[4] = {m_sBandL[0].data(), m_sBandL[1].data(), m_sBandL[2].data(), m_sBandL[3].data()};
     float* bandR[4] = {m_sBandR[0].data(), m_sBandR[1].data(), m_sBandR[2].data(), m_sBandR[3].data()};
-    m_spatialSplitter.Process(L, R, frames, bandL, bandR);
+    m_spatialSplitter.Process(rL, rR, frames, bandL, bandR);
 
-    // Aliases for readability
-    float* bL0 = bandL[0]; float* bL1 = bandL[1]; float* bL2 = bandL[2]; float* bL3 = bandL[3];
-    float* bR0 = bandR[0]; float* bR1 = bandR[1]; float* bR2 = bandR[2]; float* bR3 = bandR[3];
+    // Aliases for readability (residual bands)
+    float* bL1 = bandL[1]; float* bL2 = bandL[2]; float* bL3 = bandL[3];
+    float* bR1 = bandR[1]; float* bR2 = bandR[2]; float* bR3 = bandR[3];
 
     // --- Per-band correlation ---
     float corr[4];
@@ -543,14 +565,17 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         corr[b] = m_spatialCorrelation.ProcessBand(b, bandL[b], bandR[b], frames);
     }
 
-    // (#5: Smooth surround weights across blocks for natural transitions)
-    // Squared for steeper vocal rejection: when correlation is high (vocals),
-    // sw drops much faster. e.g. corr=0.5 → linear sw=0.25, squared sw=0.06
+    // Smoothed surround weights per band: linear mapping of correlation to a
+    // [0..1] gate. No squaring — the SpectralSeparator already peels centre
+    // content out at the source, so aggressive vocal-rejection on top of that
+    // was costing the surrounds ~6 dB for no added benefit. The linear sw
+    // still acts as a gentle defensive floor against any centre energy that
+    // slips past the spectral mask.
     float sw[4];
     for (int b = 0; b < 4; ++b) {
         float target = 1.0f - (corr[b] + 1.0f) * 0.5f;
         m_smoothSW[b] += kSWSmoothing * (target - m_smoothSW[b]);
-        sw[b] = m_smoothSW[b] * m_smoothSW[b]; // squared for aggressive gating
+        sw[b] = m_smoothSW[b];
     }
 
     // --- Transient detection ---
@@ -559,16 +584,16 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
     m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
 
-    // --- Compute per-band mid/side ---
+    // --- Per-band sides (residual bands -> already centre-free) ---
     for (uint32_t i = 0; i < frames; ++i) {
-        m_sMid0[i]  = (bL0[i] + bR0[i]) * 0.5f;
-        m_sMid1[i]  = (bL1[i] + bR1[i]) * 0.5f;
-        m_sMid2[i]  = (bL2[i] + bR2[i]) * 0.5f;
         m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f;
         m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f;
     }
 
-    // (#3: Dynamic position steering — compute L/R energy balance)
+    // Dynamic L/R position steering: compute energy balance on the delayed mid
+    // range and slide the L/R objects slightly toward the dominant side. Base
+    // angles are the ITU reference ±30° positions; the balance adds at most
+    // ±0.08 of horizontal sway so the pair never collapses.
     float energyL = 0.0f, energyR = 0.0f;
     int step = std::max(1, sampleFrames / 64);
     for (VstInt32 i = 0; i < sampleFrames; i += step) {
@@ -576,75 +601,142 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         energyR += R[i] * R[i];
     }
     float totalEnergy = energyL + energyR + 1e-10f;
-    float balance = (energyR - energyL) / totalEnergy; // -1 = all left, +1 = all right
+    float rawBalance = (energyR - energyL) / totalEnergy; // -1 = all left, +1 = all right
 
-    // Steer L/R object positions based on balance (subtle, ±0.15 shift)
-    float leftX  = -0.7f + balance * 0.15f;  // shifts right when R dominates
-    float rightX =  0.7f + balance * 0.15f;  // shifts right when R dominates
-    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_LEFT,  leftX,  0.0f, -0.5f);
-    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_RIGHT, rightX, 0.0f, -0.5f);
+    // One-pole smoothing so sudden panning (e.g. a hard-left effect) slides
+    // the front pair across the stage rather than teleporting.
+    m_smoothBalance += kBalanceSmoothing * (rawBalance - m_smoothBalance);
 
-    // Steer vocal slightly based on correlated content balance
-    float vocalBalance = 0.0f;
+    float leftX  = -0.500f + m_smoothBalance * 0.08f;
+    float rightX =  0.500f + m_smoothBalance * 0.08f;
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_LEFT,  leftX,  0.0f, -0.866f);
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_RIGHT, rightX, 0.0f, -0.866f);
+
+    // Vocal head-lock with pitch-tracked elevation.
+    //
+    // Azimuth is rock-locked at 0° (centre image never wobbles). Elevation
+    // instead tracks a rough fundamental-frequency estimate derived from the
+    // zero-crossing rate of the spectral centre stream: low voices (narrators,
+    // chest voice) sit at y=0; high voices (soprano, head voice, emphatic
+    // dialogue) float slightly upward.  The distance is pulled in to z=-0.7
+    // for an intimate "head in the room" feel, matching how Dolby encodes
+    // dialogue objects in mixed content.
+    //
+    // The pitch update is energy-gated: during silence, m_smoothVocalPitch
+    // holds its previous value rather than drifting back to zero, so the
+    // very first syllable after a pause enters at a sensible elevation.
     {
-        float vEnergyL = 0.0f, vEnergyR = 0.0f;
-        for (VstInt32 i = 0; i < sampleFrames; i += step) {
-            vEnergyL += bL1[i] * bL1[i];
-            vEnergyR += bR1[i] * bR1[i];
+        float centerEnergy = 0.0f;
+        int crossings = 0;
+        float prev = 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            float s = C[i];
+            centerEnergy += s * s;
+            if ((s >= 0.0f) != (prev >= 0.0f)) ++crossings;
+            prev = s;
         }
-        float vTotal = vEnergyL + vEnergyR + 1e-10f;
-        vocalBalance = (vEnergyR - vEnergyL) / vTotal;
-    }
-    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_VOCAL,
-        vocalBalance * 0.10f, 0.0f, -0.8f); // subtle ±0.1 horizontal shift
 
-    // --- OBJ_SUBBASS: full sub-bass band (<200Hz) + low-mid bass (200-400Hz) ---
-    // Send the full sub-bass band without extra lowpass, plus some low-mid
-    // content for warmth. This ensures the subwoofer gets proper 40-200Hz+ signal
-    // rather than just the ultra-low content below 80Hz.
-    for (uint32_t i = 0; i < frames; ++i) {
-        m_sScratch[i] = m_sMid0[i] * 0.70f        // full sub-bass band (<200Hz)
-                       + m_sMid1[i] * 0.30f;        // low-mid body (200Hz-2kHz) for warmth
+        // Gate: require at least -60 dBFS average level before trusting the ZCR.
+        float meanEnergy = centerEnergy / static_cast<float>(frames);
+        if (meanEnergy > 1e-6f) {
+            // ZCR ≈ 2·f0 for a mostly-periodic signal. Convert to Hz and
+            // divide by 2 to estimate fundamental.
+            float zcr = static_cast<float>(crossings) * m_sampleRate
+                      / static_cast<float>(frames);
+            float estF0 = zcr * 0.5f;
+
+            // Map [100..400] Hz → [0..1]. Below 100 Hz treats as low voice,
+            // above 400 Hz as full soprano.
+            float target = (estF0 - 100.0f) / 300.0f;
+            if (target < 0.0f) target = 0.0f;
+            if (target > 1.0f) target = 1.0f;
+
+            m_smoothVocalPitch += kPitchSmoothing * (target - m_smoothVocalPitch);
+        }
+
+        // Subtle elevation swing up to +0.15 units, kept small so dialogue
+        // never detaches from the front image.
+        float vy = m_smoothVocalPitch * 0.15f;
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_VOCAL, 0.0f, vy, -0.7f);
     }
+
+    // Dynamic height elevation via the Pratt effect: bright residual content
+    // floats the height pair upward; dark/bass-heavy content settles it back
+    // toward a lower elevation. Brightness is computed from the residual band
+    // energies (band 3 / total), smoothed at block rate, and mapped to an
+    // elevation angle. Azimuth stays at ±30°; the (x,y,z) trace the unit
+    // sphere so the objects move along a front-ceiling arc.
+    {
+        float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            e0 += bandL[0][i] * bandL[0][i] + bandR[0][i] * bandR[0][i];
+            e1 += bandL[1][i] * bandL[1][i] + bandR[1][i] * bandR[1][i];
+            e2 += bandL[2][i] * bandL[2][i] + bandR[2][i] * bandR[2][i];
+            e3 += bandL[3][i] * bandL[3][i] + bandR[3][i] * bandR[3][i];
+        }
+        float total = e0 + e1 + e2 + e3 + 1e-10f;
+        float rawBrightness = e3 / total; // typical 0.02..0.25 for music
+
+        // Stretch the practical [0, 0.25] range to [0, 1] so subtle treble
+        // variations still move the objects meaningfully.
+        float target = std::min(1.0f, rawBrightness * 4.0f);
+        m_smoothHeightBrightness += kBrightnessSmoothing * (target - m_smoothHeightBrightness);
+
+        // Map smoothed brightness [0..1] to elevation [35°..70°].
+        constexpr float kPi = 3.14159265f;
+        constexpr float kMinElevRad = 35.0f * kPi / 180.0f;
+        constexpr float kMaxElevRad = 70.0f * kPi / 180.0f;
+        float elev = kMinElevRad + m_smoothHeightBrightness * (kMaxElevRad - kMinElevRad);
+        float hy = std::sin(elev);
+        float horiz = std::cos(elev);
+        constexpr float kSin30 = 0.5f;
+        constexpr float kCos30 = 0.8660254f;
+        float hxMag = horiz * kSin30;
+        float hz    = -horiz * kCos30;
+
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_HEIGHT_LEFT,  -hxMag, hy, hz);
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, +hxMag, hy, hz);
+    }
+
+    // --- OBJ_SUBBASS: 80 Hz lowpass of the DELAYED ORIGINAL mid ---
+    // Fed from the pre-subtraction signal so centred kicks, bass guitar, and
+    // sub synths still reach the sub regardless of the spectral centre mask.
+    m_spatialLfeLowpass.Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
-    // --- OBJ_VOCAL: centre-panned content across all mid bands ---
-    {
-        float cw1 = (corr[1] + 1.0f) * 0.5f;
-        float cw2 = (corr[2] + 1.0f) * 0.5f;
-        for (uint32_t i = 0; i < frames; ++i) {
-            float tBoost = 1.0f + m_sTransients[i] * 0.3f;
-            m_sVocal[i] = m_sMid0[i] * 0.40f
-                        + m_sMid1[i] * 0.85f * cw1 * tBoost
-                        + m_sMid2[i] * 0.70f * cw2 * tBoost;
-        }
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, m_sVocal.data(), frames);
-    }
+    // --- OBJ_VOCAL: per-bin spectral centre, directly ---
+    // No more band-correlation heuristics; the STFT mask already isolated the
+    // centred content cleanly in the separator.
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, C, frames);
 
-    // --- OBJ_LEFT / OBJ_RIGHT: full original L/R (source-preserving) ---
-    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, L, frames);
-    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, R, frames);
+    // --- OBJ_LEFT / OBJ_RIGHT: residual (delayed L/R minus spectral centre) ---
+    // Vocals are now fully peeled out, so these carry the panned non-centre
+    // content only — guitars, pads, FX.
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
 
     // --- OBJ_SURR_LEFT/RIGHT: ambient content from all mid bands ---
     {
         std::memset(m_sSurrL.data(), 0, frames * sizeof(float));
         std::memset(m_sSurrR.data(), 0, frames * sizeof(float));
 
-        // (#2: Low-mid ambient — room tone, reverb tails for envelopment)
+        // Low-mid ambient (residual band 1 side) for room tone and reverb tails.
+        // bL1/bR1 are already centre-free; the side component is pure width.
         {
             for (uint32_t i = 0; i < frames; ++i) {
-                m_sAmbL[i] = (bL1[i] - m_sMid1[i]) * sw[1];
-                m_sAmbR[i] = (bR1[i] - m_sMid1[i]) * sw[1];
+                float sideL = (bL1[i] - bR1[i]) * 0.5f;
+                m_sAmbL[i] =  sideL * sw[1];
+                m_sAmbR[i] = -sideL * sw[1];
             }
             m_spatialDecorr[0].Process(m_sAmbL.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrL[i] += m_sScratch[i] * 0.30f * tDuck;
+                m_sSurrL[i] += m_sScratch[i] * 1.00f * tDuck;
             }
             m_spatialDecorr[1].Process(m_sAmbR.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrR[i] += m_sScratch[i] * 0.30f * tDuck;
+                m_sSurrR[i] += m_sScratch[i] * 1.00f * tDuck;
             }
         }
 
@@ -652,18 +744,18 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialDecorr[2].Process(m_sSide2.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrL[i] += m_sScratch[i] * 0.50f * sw[2] * tDuck;
+            m_sSurrL[i] += m_sScratch[i] * 1.55f * sw[2] * tDuck;
         }
         m_spatialDecorr[3].Process(m_sSide2.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrR[i] += m_sScratch[i] * 0.50f * sw[2] * tDuck;
+            m_sSurrR[i] += m_sScratch[i] * 1.55f * sw[2] * tDuck;
         }
 
         // Treble side
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] += m_sSide3[i] * 0.40f * sw[3];
-            m_sSurrR[i] -= m_sSide3[i] * 0.40f * sw[3]; // inverted for width
+            m_sSurrL[i] += m_sSide3[i] * 1.25f * sw[3];
+            m_sSurrR[i] -= m_sSide3[i] * 1.25f * sw[3]; // inverted for width
         }
 
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_LEFT, m_sSurrL.data(), frames);
@@ -671,18 +763,15 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
 
     // --- OBJ_HEIGHT_LEFT/RIGHT: full-bandwidth ambient overhead ---
-    // Full L/R with centre removed, transient-ducked, then decorrelated.
-    // No frequency band exclusions — all bands contribute for full-range
-    // speaker output (tweeters AND mid-range cones).
+    // Fed from the residuals directly (already centre-free, full-band),
+    // transient-ducked and decorrelated for diffusion.
     {
         for (uint32_t i = 0; i < frames; ++i) {
-            float mid = (L[i] + R[i]) * 0.5f;
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sAmbL[i] = (L[i] - mid) * 0.45f * tDuck;
-            m_sAmbR[i] = (R[i] - mid) * 0.45f * tDuck;
+            m_sAmbL[i] = rL[i] * 1.10f * tDuck;
+            m_sAmbR[i] = rR[i] * 1.10f * tDuck;
         }
 
-        // Single decorrelator pass for diffusion
         m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
         m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
 

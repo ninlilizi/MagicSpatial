@@ -11,16 +11,19 @@ namespace MagicSpatial {
 
 #define Log LogMsg
 
-// Default 3D positions for each object slot
+// Default 3D positions for each object slot.
+// Angles follow ITU-R BS.2051 reference geometry for 7.1.4 / 5.1.4 rooms.
+// Coordinate system: +X right, +Y up, -Z forward. All positions lie on the
+// unit sphere (|pos| ~= 1) except SUBBASS which is placed slightly grounded.
 const SpatialObjectWriter::ObjectPosition SpatialObjectWriter::kDefaultPositions[OBJ_COUNT] = {
-    { 0.0f, -0.3f,  0.0f},  // OBJ_SUBBASS:      centre, grounded
-    { 0.0f,  0.0f, -0.8f},  // OBJ_VOCAL:         front centre
-    {-0.7f,  0.0f, -0.5f},  // OBJ_LEFT:          front left
-    { 0.7f,  0.0f, -0.5f},  // OBJ_RIGHT:         front right
-    {-0.8f,  0.0f,  0.3f},  // OBJ_SURR_LEFT:     left surround
-    { 0.8f,  0.0f,  0.3f},  // OBJ_SURR_RIGHT:    right surround
-    {-0.5f,  1.0f,  0.0f},  // OBJ_HEIGHT_LEFT:   directly above, left
-    { 0.5f,  1.0f,  0.0f},  // OBJ_HEIGHT_RIGHT:  directly above, right
+    { 0.000f, -0.300f,  0.000f}, // OBJ_SUBBASS:     centre, grounded (low-freq omnidirectional)
+    { 0.000f,  0.000f, -0.700f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (intimate, pitch-tracked)
+    {-0.500f,  0.000f, -0.866f}, // OBJ_LEFT:       -30° azimuth, 0° elevation
+    { 0.500f,  0.000f, -0.866f}, // OBJ_RIGHT:      +30° azimuth, 0° elevation
+    {-0.985f,  0.000f,  0.174f}, // OBJ_SURR_LEFT: -100° azimuth, 0° elevation  (side, slightly rear)
+    { 0.985f,  0.000f,  0.174f}, // OBJ_SURR_RIGHT:+100° azimuth, 0° elevation
+    {-0.354f,  0.707f, -0.612f}, // OBJ_HEIGHT_LEFT: -30° azimuth, +45° elevation (top front L)
+    { 0.354f,  0.707f, -0.612f}, // OBJ_HEIGHT_RIGHT:+30° azimuth, +45° elevation (top front R)
 };
 
 // --- IActivateAudioInterfaceCompletionHandler for async activation ---
