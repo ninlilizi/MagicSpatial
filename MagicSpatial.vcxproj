@@ -102,6 +102,7 @@
     <ClCompile Include="src\processing\UpmixEngine.cpp" />
     <ClCompile Include="src\processing\StereoUpmixer.cpp" />
     <ClCompile Include="src\processing\EnhancedStereoUpmixer.cpp" />
+    <ClCompile Include="src\processing\SpectralSeparator.cpp" />
     <ClCompile Include="src\processing\MultibandSplitter.cpp" />
     <ClCompile Include="src\processing\TransientDetector.cpp" />
     <ClCompile Include="src\processing\StereoCorrelationAnalyzer.cpp" />
@@ -123,6 +124,7 @@
     <ClInclude Include="src\processing\UpmixEngine.h" />
     <ClInclude Include="src\processing\StereoUpmixer.h" />
     <ClInclude Include="src\processing\EnhancedStereoUpmixer.h" />
+    <ClInclude Include="src\processing\SpectralSeparator.h" />
     <ClInclude Include="src\processing\MultibandSplitter.h" />
     <ClInclude Include="src\processing\TransientDetector.h" />
     <ClInclude Include="src\processing\StereoCorrelationAnalyzer.h" />

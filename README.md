@@ -4,13 +4,13 @@ An [Equalizer APO](https://sourceforge.net/projects/equalizerapo/) plugin that t
 
 ## How it works
 
-Stereo input is split into four frequency bands and analysed for stereo correlation (centre vs ambient) and transients (impacts vs sustain). The results feed 8 spatial objects:
+Stereo input first runs through a streaming STFT that extracts the phantom centre **per frequency bin** (Avendano-Jot style phase/amplitude mask), so vocals are peeled cleanly away from overlapping instruments instead of the whole low-mid band being dragged along. The delay-aligned L/R residual is then split into four frequency bands and analysed for stereo correlation and transients. The results feed 8 spatial objects:
 
 | Object | Content | Position |
 |---|---|---|
 | Sub-bass | Lowpassed mid | Centre, grounded |
-| Vocal | Correlated content across 3 bands, transient-boosted | Front centre (dynamically steered) |
-| Left / Right | Full original L/R | Front left/right (dynamically steered) |
+| Vocal | Per-bin spectral centre (phase + amplitude mask, temporally smoothed) | Front centre (dynamically steered) |
+| Left / Right | Delayed L/R with the spectral centre peeled out | Front left/right (dynamically steered) |
 | Surround L/R | Decorrelated ambient from low-mid, high-mid, treble | Behind, transient-ducked |
 | Height L/R | Diffuse ambient with HRTF high-shelf emphasis | Overhead |
 
@@ -57,15 +57,16 @@ Open MagicSpatial.sln → Release | x64 → Build → build\Release\MagicSpatial
 src/
   vst/           VstDefs.h, MagicSpatialVst.*, VstEntry.cpp
   audio/         SpatialObjectWriter.*  (ISpatialAudioClient, render thread)
-  processing/    MultibandSplitter, TransientDetector, StereoCorrelationAnalyzer,
-                 Decorrelator, Biquad, EnhancedStereoUpmixer, Surround51/71Upmixer,
+  processing/    SpectralSeparator, MultibandSplitter, TransientDetector,
+                 StereoCorrelationAnalyzer, Decorrelator, Biquad,
+                 EnhancedStereoUpmixer, Surround51/71Upmixer,
                  UpmixEngine, ChannelLayout
   core/          Types.h, Log.h
 ```
 
 ## Latency
 
-Sub-millisecond. All DSP uses zero-latency IIR filters. The spatial render thread adds ~10ms asynchronously without blocking the audio pipeline.
+~21 ms algorithmic (1024-sample STFT at 48 kHz, 50% overlap). The spectral vocal extractor is the only lookahead stage; everything downstream uses zero-latency IIR filters. The spatial render thread adds ~10 ms asynchronously without blocking the audio pipeline.
 
 ## License
 

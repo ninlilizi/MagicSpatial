@@ -40,6 +40,9 @@
     <ClCompile Include="src\processing\Surround71Upmixer.cpp">
       <Filter>src\processing</Filter>
     </ClCompile>
+    <ClCompile Include="src\processing\SpectralSeparator.cpp">
+      <Filter>src\processing</Filter>
+    </ClCompile>
   </ItemGroup>
 
   <ItemGroup>
@@ -71,6 +74,9 @@
       <Filter>src\processing</Filter>
     </ClInclude>
     <ClInclude Include="src\processing\Surround71Upmixer.h">
+      <Filter>src\processing</Filter>
+    </ClInclude>
+    <ClInclude Include="src\processing\SpectralSeparator.h">
       <Filter>src\processing</Filter>
     </ClInclude>
   </ItemGroup>

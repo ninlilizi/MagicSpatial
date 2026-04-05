@@ -3,6 +3,7 @@
 #include "processing/Biquad.h"
 #include "processing/Decorrelator.h"
 #include "processing/MultibandSplitter.h"
+#include "processing/SpectralSeparator.h"
 #include "processing/TransientDetector.h"
 #include "processing/StereoCorrelationAnalyzer.h"
 #include "core/Types.h"
@@ -23,6 +24,7 @@ public:
 
 private:
     // Sub-components
+    SpectralSeparator m_spectralSeparator;
     MultibandSplitter m_splitter;
     StereoCorrelationAnalyzer m_correlation;
     TransientDetector m_transientDetector;
@@ -39,19 +41,25 @@ private:
     // Scratch buffers
     std::vector<float> m_bandL[MultibandSplitter::kNumBands];
     std::vector<float> m_bandR[MultibandSplitter::kNumBands];
-    std::vector<float> m_bandMid;
     std::vector<float> m_bandSide;
     std::vector<float> m_fullMid;
     std::vector<float> m_transients;
     std::vector<float> m_decorrScratch;
 
+    // Spectral separator outputs (delayed L/R and per-bin extracted centre).
+    std::vector<float> m_delayedL;
+    std::vector<float> m_delayedR;
+    std::vector<float> m_centerMono;
+
+    // Residuals = delayedL/R minus the spectrally extracted centre. Fed into
+    // the MultibandSplitter so every surround/height feed is centre-free.
+    std::vector<float> m_residualL;
+    std::vector<float> m_residualR;
+
     // Gain constants
     // Sub-bass (< 200Hz)
-    static constexpr float kSubCenterGain    = 0.707f;
     static constexpr float kSubLfeGain       = 0.50f;
     // Low-mid (200Hz - 2kHz)
-    static constexpr float kLowMidFrontGain  = 0.80f;
-    static constexpr float kLowMidCenterGain = 0.60f;
     static constexpr float kLowMidSurrGain   = 0.35f;
     // High-mid (2kHz - 8kHz)
     static constexpr float kHighMidFrontGain = 0.65f;

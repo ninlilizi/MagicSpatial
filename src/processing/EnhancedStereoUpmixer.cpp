@@ -6,6 +6,7 @@ namespace MagicSpatial {
 void EnhancedStereoUpmixer::Initialize(uint32_t sampleRate, uint32_t maxFrameCount) {
     float sr = static_cast<float>(sampleRate);
 
+    m_spectralSeparator.Initialize(sr, maxFrameCount);
     m_splitter.Initialize(sr, maxFrameCount);
     m_correlation.Initialize(sr);
     m_transientDetector.Initialize(sr);
@@ -36,39 +37,69 @@ void EnhancedStereoUpmixer::Initialize(uint32_t sampleRate, uint32_t maxFrameCou
         m_bandL[b].resize(maxFrameCount);
         m_bandR[b].resize(maxFrameCount);
     }
-    m_bandMid.resize(maxFrameCount);
     m_bandSide.resize(maxFrameCount);
     m_fullMid.resize(maxFrameCount);
     m_transients.resize(maxFrameCount);
     m_decorrScratch.resize(maxFrameCount);
+    m_delayedL.resize(maxFrameCount);
+    m_delayedR.resize(maxFrameCount);
+    m_centerMono.resize(maxFrameCount);
+    m_residualL.resize(maxFrameCount);
+    m_residualR.resize(maxFrameCount);
 }
 
 void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCount, float** output) {
-    const float* L = input[0];
-    const float* R = input[1];
+    const float* inL = input[0];
+    const float* inR = input[1];
 
-    // Front L/R: pass through the original source UNCHANGED.
-    // All other channels are purely additive — we never subtract from the source.
-    std::memcpy(output[CH_FL], L, frameCount * sizeof(float));
-    std::memcpy(output[CH_FR], R, frameCount * sizeof(float));
+    // Step 0: Frequency-domain separation.
+    // Produces delayed L/R (kFftSize-sample delay matching the OLA) and a
+    // per-bin extracted mono centre. Residual L/R = delayed L/R - centre gives
+    // clean vocal removal without touching overlapping neighbouring frequencies.
+    m_spectralSeparator.Process(inL, inR, frameCount,
+                                m_delayedL.data(), m_delayedR.data(), m_centerMono.data());
 
-    // Zero the synthesized channels (C, LFE, surrounds, heights)
+    const float* dL = m_delayedL.data();
+    const float* dR = m_delayedR.data();
+    const float* C  = m_centerMono.data();
+
+    // Compute residuals (delayed L/R minus per-bin spectral centre). Everything
+    // downstream except LFE runs on residuals so vocals NEVER reach the
+    // surrounds or heights — not via side, not via direct band taps.
+    for (uint32_t i = 0; i < frameCount; ++i) {
+        m_residualL[i] = dL[i] - C[i];
+        m_residualR[i] = dR[i] - C[i];
+    }
+    const float* rL = m_residualL.data();
+    const float* rR = m_residualR.data();
+
+    // Front L/R = residuals. CH_C = spectrally extracted centre.
+    std::memcpy(output[CH_FL], rL, frameCount * sizeof(float));
+    std::memcpy(output[CH_FR], rR, frameCount * sizeof(float));
+
+    // Zero the synthesized channels (C, LFE, surrounds, heights) then seed the
+    // centre with the spectral extraction.
     for (int ch = CH_C; ch < kAtmosChannelCount; ++ch) {
         std::memset(output[ch], 0, frameCount * sizeof(float));
     }
+    std::memcpy(output[CH_C], C, frameCount * sizeof(float));
 
-    // Step 1: Split stereo into 4 frequency bands
+    // Step 1: Split RESIDUAL stereo into 4 frequency bands. Because the centre
+    // is already peeled off, every downstream feed (side-based surrounds AND
+    // direct band-tap heights) is automatically centre-free.
     float* bL[MultibandSplitter::kNumBands] = {
         m_bandL[0].data(), m_bandL[1].data(), m_bandL[2].data(), m_bandL[3].data()
     };
     float* bR[MultibandSplitter::kNumBands] = {
         m_bandR[0].data(), m_bandR[1].data(), m_bandR[2].data(), m_bandR[3].data()
     };
-    m_splitter.Process(L, R, frameCount, bL, bR);
+    m_splitter.Process(rL, rR, frameCount, bL, bR);
 
-    // Step 2: Full-band transient detection
+    // Step 2: Full-band transient detection on the ORIGINAL delayed mid. We use
+    // the original (not residual) here because percussive transients are often
+    // centred (kicks, snares) and we still want to detect them.
     for (uint32_t i = 0; i < frameCount; ++i) {
-        m_fullMid[i] = (L[i] + R[i]) * 0.5f;
+        m_fullMid[i] = (dL[i] + dR[i]) * 0.5f;
     }
     m_transientDetector.Process(m_fullMid.data(), m_transients.data(), frameCount);
 
@@ -85,37 +116,24 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
         surroundWeight[b] = 1.0f - cn;
     }
 
-    // ========== Band 0: Sub-bass (< 200Hz) ==========
-    // Synthesize Center and LFE. Front L/R already have the full source.
+    // ========== LFE (< 80Hz) ==========
+    // Fed from the ORIGINAL delayed mid (m_fullMid), NOT from the residual
+    // band 0, so that centred sub content (kicks, bass guitar, synths) still
+    // reaches the sub instead of vanishing into the centre object.
     {
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            m_bandMid[i] = (bL[0][i] + bR[0][i]) * 0.5f;
-        }
-
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            output[CH_C][i] += m_bandMid[i] * kSubCenterGain;
-        }
-
-        m_lfeLowpass.Process(m_bandMid.data(), m_decorrScratch.data(), frameCount);
+        m_lfeLowpass.Process(m_fullMid.data(), m_decorrScratch.data(), frameCount);
         for (uint32_t i = 0; i < frameCount; ++i) {
             output[CH_LFE][i] += m_decorrScratch[i] * kSubLfeGain;
         }
     }
 
     // ========== Band 1: Low-mid (200Hz - 2kHz) ==========
-    // Synthesize Center and Surrounds. Front L/R untouched.
+    // Surrounds only. Per-bin spectral centre.
     {
-        float cw = (corr[1] + 1.0f) * 0.5f;
         float sw = surroundWeight[1];
 
         for (uint32_t i = 0; i < frameCount; ++i) {
-            m_bandMid[i]  = (bL[1][i] + bR[1][i]) * 0.5f;
             m_bandSide[i] = (bL[1][i] - bR[1][i]) * 0.5f;
-        }
-
-        for (uint32_t i = 0; i < frameCount; ++i) {
-            float tBoost = 1.0f + m_transients[i] * 0.3f;
-            output[CH_C][i] += m_bandMid[i] * kLowMidCenterGain * cw * tBoost;
         }
 
         m_band1Decorr[0].Process(m_bandSide.data(), m_decorrScratch.data(), frameCount);
@@ -210,17 +228,10 @@ void EnhancedStereoUpmixer::Process(const float* const* input, uint32_t frameCou
             output[CH_TBR][i] += m_decorrScratch[i] * kTrebleBackHeightGain;
         }
     }
-
-    // Centre channel exception: subtract centre content from FL/FR so that
-    // vocals/dialogue anchor to the physical centre speaker rather than
-    // doubling as both phantom centre (in L/R) and discrete centre.
-    for (uint32_t i = 0; i < frameCount; ++i) {
-        output[CH_FL][i] -= output[CH_C][i] * 0.5f;
-        output[CH_FR][i] -= output[CH_C][i] * 0.5f;
-    }
 }
 
 void EnhancedStereoUpmixer::Reset() {
+    m_spectralSeparator.Reset();
     m_splitter.Reset();
     m_correlation.Reset();
     m_transientDetector.Reset();
