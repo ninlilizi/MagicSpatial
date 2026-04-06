@@ -28,16 +28,20 @@ namespace MagicSpatial {
 //   4. Call Shutdown() to clean up
 class SpatialObjectWriter {
 public:
-    // Object slots for our spatial components
+    // Object slots for our spatial components (7.1.4 layout, 12 objects)
     enum ObjectSlot {
         OBJ_SUBBASS = 0,     // Centre, grounded
         OBJ_VOCAL,            // Front centre
         OBJ_LEFT,             // Front left
         OBJ_RIGHT,            // Front right
-        OBJ_SURR_LEFT,        // Left surround
-        OBJ_SURR_RIGHT,       // Right surround
-        OBJ_HEIGHT_LEFT,      // Overhead left
-        OBJ_HEIGHT_RIGHT,     // Overhead right
+        OBJ_SIDE_LEFT,        // Side left (±90°)
+        OBJ_SIDE_RIGHT,       // Side right
+        OBJ_BACK_LEFT,        // Back left (±135°)
+        OBJ_BACK_RIGHT,       // Back right
+        OBJ_TOP_FRONT_L,      // Top front left (±30°, +45° elev)
+        OBJ_TOP_FRONT_R,      // Top front right
+        OBJ_TOP_BACK_L,       // Top back left (±150°, +45° elev)
+        OBJ_TOP_BACK_R,       // Top back right
         OBJ_COUNT
     };
 

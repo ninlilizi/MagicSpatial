@@ -661,11 +661,12 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
 
     // Dynamic height elevation via the Pratt effect: bright residual content
-    // floats the height pair upward; dark/bass-heavy content settles it back
-    // toward a lower elevation. Brightness is computed from the residual band
-    // energies (band 3 / total), smoothed at block rate, and mapped to an
-    // elevation angle. Azimuth stays at ±30°; the (x,y,z) trace the unit
-    // sphere so the objects move along a front-ceiling arc.
+    // floats all four overhead objects upward; dark/bass-heavy content settles
+    // them back. Brightness is computed from residual band energies (band 3 /
+    // total), smoothed at block rate, and mapped to an elevation angle.
+    // Top-front and top-back share the same elevation but have different
+    // azimuths (±30° front, ±150° back).
+    float hy, hxMag, hzFront, hzBack;
     {
         float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
         for (uint32_t i = 0; i < frames; ++i) {
@@ -675,53 +676,52 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             e3 += bandL[3][i] * bandL[3][i] + bandR[3][i] * bandR[3][i];
         }
         float total = e0 + e1 + e2 + e3 + 1e-10f;
-        float rawBrightness = e3 / total; // typical 0.02..0.25 for music
+        float rawBrightness = e3 / total;
 
-        // Stretch the practical [0, 0.25] range to [0, 1] so subtle treble
-        // variations still move the objects meaningfully.
         float target = std::min(1.0f, rawBrightness * 4.0f);
         m_smoothHeightBrightness += kBrightnessSmoothing * (target - m_smoothHeightBrightness);
 
-        // Map smoothed brightness [0..1] to elevation [35°..70°].
         constexpr float kPi = 3.14159265f;
         constexpr float kMinElevRad = 35.0f * kPi / 180.0f;
         constexpr float kMaxElevRad = 70.0f * kPi / 180.0f;
         float elev = kMinElevRad + m_smoothHeightBrightness * (kMaxElevRad - kMinElevRad);
-        float hy = std::sin(elev);
+        hy = std::sin(elev);
         float horiz = std::cos(elev);
         constexpr float kSin30 = 0.5f;
         constexpr float kCos30 = 0.8660254f;
-        float hxMag = horiz * kSin30;
-        float hz    = -horiz * kCos30;
+        hxMag   = horiz * kSin30;
+        hzFront = -horiz * kCos30;  // negative Z = forward
+        hzBack  =  horiz * kCos30;  // positive Z = behind
 
-        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_HEIGHT_LEFT,  -hxMag, hy, hz);
-        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, +hxMag, hy, hz);
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_TOP_FRONT_L, -hxMag, hy, hzFront);
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_TOP_FRONT_R, +hxMag, hy, hzFront);
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_TOP_BACK_L,  -hxMag, hy, hzBack);
+        m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_TOP_BACK_R,  +hxMag, hy, hzBack);
     }
 
     // --- OBJ_SUBBASS: 80 Hz lowpass of the DELAYED ORIGINAL mid ---
-    // Fed from the pre-subtraction signal so centred kicks, bass guitar, and
-    // sub synths still reach the sub regardless of the spectral centre mask.
     m_spatialLfeLowpass.Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
     // --- OBJ_VOCAL: per-bin spectral centre, directly ---
-    // No more band-correlation heuristics; the STFT mask already isolated the
-    // centred content cleanly in the separator.
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, C, frames);
 
-    // --- OBJ_LEFT / OBJ_RIGHT: residual (delayed L/R minus spectral centre) ---
-    // Vocals are now fully peeled out, so these carry the panned non-centre
-    // content only — guitars, pads, FX.
+    // --- OBJ_LEFT / OBJ_RIGHT: residuals (delayed L/R minus spectral centre) ---
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
 
-    // --- OBJ_SURR_LEFT/RIGHT: ambient content from all mid bands ---
+    // ================================================================
+    // SURROUND SPLIT: each frequency band feeds exactly ONE object pair.
+    // Band 1 + band 3 → SIDES (±90°), band 2 → BACKS (±135°).
+    // No audio content is duplicated — zero echo risk.
+    // ================================================================
+
+    // --- OBJ_SIDE_LEFT/RIGHT: band 1 (room warmth) + band 3 (treble shimmer) ---
     {
         std::memset(m_sSurrL.data(), 0, frames * sizeof(float));
         std::memset(m_sSurrR.data(), 0, frames * sizeof(float));
 
-        // Low-mid ambient (residual band 1 side) for room tone and reverb tails.
-        // bL1/bR1 are already centre-free; the side component is pure width.
+        // Band 1 low-mid side through decorrelators [0, 1]
         {
             for (uint32_t i = 0; i < frames; ++i) {
                 float sideL = (bL1[i] - bR1[i]) * 0.5f;
@@ -731,52 +731,84 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_spatialDecorr[0].Process(m_sAmbL.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrL[i] += m_sScratch[i] * 1.00f * tDuck;
+                m_sSurrL[i] += m_sScratch[i] * 1.60f * tDuck;
             }
             m_spatialDecorr[1].Process(m_sAmbR.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrR[i] += m_sScratch[i] * 1.00f * tDuck;
+                m_sSurrR[i] += m_sScratch[i] * 1.60f * tDuck;
             }
         }
 
-        // High-mid side (transient-ducked)
+        // Band 3 treble side (direct, no decorrelator — inverted for width)
+        for (uint32_t i = 0; i < frames; ++i) {
+            m_sSurrL[i] += m_sSide3[i] * 1.75f * sw[3];
+            m_sSurrR[i] -= m_sSide3[i] * 1.75f * sw[3];
+        }
+
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_LEFT, m_sSurrL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), frames);
+    }
+
+    // --- OBJ_BACK_LEFT/RIGHT: band 2 (presence depth, 2k-8k) ---
+    // Reuses m_sSurrL/R (safe — SubmitObjectAudio already copied the side data).
+    {
         m_spatialDecorr[2].Process(m_sSide2.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrL[i] += m_sScratch[i] * 1.55f * sw[2] * tDuck;
+            m_sSurrL[i] = m_sScratch[i] * 2.50f * sw[2] * tDuck;
         }
         m_spatialDecorr[3].Process(m_sSide2.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrR[i] += m_sScratch[i] * 1.55f * sw[2] * tDuck;
+            m_sSurrR[i] = m_sScratch[i] * 2.50f * sw[2] * tDuck;
         }
 
-        // Treble side
-        for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] += m_sSide3[i] * 1.25f * sw[3];
-            m_sSurrR[i] -= m_sSide3[i] * 1.25f * sw[3]; // inverted for width
-        }
-
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_LEFT, m_sSurrL.data(), frames);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SURR_RIGHT, m_sSurrR.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_LEFT, m_sSurrL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), frames);
     }
 
-    // --- OBJ_HEIGHT_LEFT/RIGHT: full-bandwidth ambient overhead ---
-    // Fed from the residuals directly (already centre-free, full-band),
-    // transient-ducked and decorrelated for diffusion.
+    // ================================================================
+    // HEIGHT SPLIT: band 2 mid → top-front, band 3 direct → top-back.
+    // Band 2 feeds BACKS as side (L-R)/2 and TOP_FRONT as mid (L+R)/2 —
+    // these are mathematically orthogonal, so zero comb filtering.
+    // Band 3 feeds TOP_BACK only (different frequency entirely).
+    // ================================================================
+
+    // --- OBJ_TOP_FRONT_L/R: band 2 residual mono mid, decorrelated ---
+    // Using mid = (bL2+bR2)/2 makes this orthogonal to the BACK feed which
+    // uses side = (bL2-bR2)/2. Both decorrelator outputs are distinct because
+    // presets [4,5] differ from [2,3].
     {
         for (uint32_t i = 0; i < frames; ++i) {
+            float mid2 = (bL2[i] + bR2[i]) * 0.5f;
             float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sAmbL[i] = rL[i] * 1.10f * tDuck;
-            m_sAmbR[i] = rR[i] * 1.10f * tDuck;
+            m_sAmbL[i] = mid2 * 2.00f * tDuck;
+            m_sAmbR[i] = mid2 * 2.00f * tDuck;
         }
 
         m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
         m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
 
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_LEFT, m_sHeightL.data(), frames);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_HEIGHT_RIGHT, m_sHeightR.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), frames);
+    }
+
+    // --- OBJ_TOP_BACK_L/R: band 3 residual direct, decorrelated ---
+    // Entirely different frequency band (>8k) from top-front (2k-8k). Zero
+    // content overlap. Decorrelator presets [6,7] provide distinct diffusion.
+    {
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            m_sAmbL[i] = bL3[i] * 2.80f * tDuck;
+            m_sAmbR[i] = bR3[i] * 2.80f * tDuck;
+        }
+
+        m_spatialDecorr[6].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
+        m_spatialDecorr[7].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
+
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), frames);
     }
 
     // Write original L/R to channel outputs as fallback. The caller

@@ -12,18 +12,22 @@ namespace MagicSpatial {
 #define Log LogMsg
 
 // Default 3D positions for each object slot.
-// Angles follow ITU-R BS.2051 reference geometry for 7.1.4 / 5.1.4 rooms.
+// Angles follow ITU-R BS.2051 reference geometry for 7.1.4 rooms.
 // Coordinate system: +X right, +Y up, -Z forward. All positions lie on the
 // unit sphere (|pos| ~= 1) except SUBBASS which is placed slightly grounded.
 const SpatialObjectWriter::ObjectPosition SpatialObjectWriter::kDefaultPositions[OBJ_COUNT] = {
-    { 0.000f, -0.300f,  0.000f}, // OBJ_SUBBASS:     centre, grounded (low-freq omnidirectional)
-    { 0.000f,  0.000f, -0.700f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (intimate, pitch-tracked)
+    { 0.000f, -0.300f,  0.000f}, // OBJ_SUBBASS:     centre, grounded
+    { 0.000f,  0.000f, -0.700f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (intimate)
     {-0.500f,  0.000f, -0.866f}, // OBJ_LEFT:       -30° azimuth, 0° elevation
     { 0.500f,  0.000f, -0.866f}, // OBJ_RIGHT:      +30° azimuth, 0° elevation
-    {-0.985f,  0.000f,  0.174f}, // OBJ_SURR_LEFT: -100° azimuth, 0° elevation  (side, slightly rear)
-    { 0.985f,  0.000f,  0.174f}, // OBJ_SURR_RIGHT:+100° azimuth, 0° elevation
-    {-0.354f,  0.707f, -0.612f}, // OBJ_HEIGHT_LEFT: -30° azimuth, +45° elevation (top front L)
-    { 0.354f,  0.707f, -0.612f}, // OBJ_HEIGHT_RIGHT:+30° azimuth, +45° elevation (top front R)
+    {-1.000f,  0.000f,  0.000f}, // OBJ_SIDE_LEFT:  -90° azimuth, 0° elevation
+    { 1.000f,  0.000f,  0.000f}, // OBJ_SIDE_RIGHT: +90° azimuth, 0° elevation
+    {-0.707f,  0.000f,  0.707f}, // OBJ_BACK_LEFT: -135° azimuth, 0° elevation
+    { 0.707f,  0.000f,  0.707f}, // OBJ_BACK_RIGHT:+135° azimuth, 0° elevation
+    {-0.354f,  0.707f, -0.612f}, // OBJ_TOP_FRONT_L: -30° azimuth, +45° elevation
+    { 0.354f,  0.707f, -0.612f}, // OBJ_TOP_FRONT_R: +30° azimuth, +45° elevation
+    {-0.354f,  0.707f,  0.612f}, // OBJ_TOP_BACK_L: -150° azimuth, +45° elevation
+    { 0.354f,  0.707f,  0.612f}, // OBJ_TOP_BACK_R: +150° azimuth, +45° elevation
 };
 
 // --- IActivateAudioInterfaceCompletionHandler for async activation ---
