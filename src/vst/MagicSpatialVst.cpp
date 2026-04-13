@@ -410,10 +410,14 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
     }
 
     // --- Spatial object mode ---
-    // Always enter the spatial path for Auto/Stereo mode. Submit audio to the
-    // spatial writer even while it's still activating (it buffers safely).
-    // Only zero channel output once the writer is confirmed active.
-    if (m_paramMode < 0.125f || m_paramMode < 0.375f) { // Auto or Stereo
+    // The spatial path only handles stereo input — it indexes inputs[0]/[1]
+    // and ignores the rest. Multi-channel content (5.1/7.1/Atmos) must go
+    // through the engine/channel path below so its rear and height channels
+    // are not silenced. We therefore enter the spatial path only when the
+    // RESOLVED layout is Stereo: explicit Stereo mode forced it at line 400,
+    // or Auto mode detected stereo input.
+    if (targetLayout == InputLayout::Stereo &&
+        (m_paramMode < 0.125f || m_paramMode < 0.375f)) { // Auto or Stereo
         ProcessSpatialObjects(inputs, outputs, sampleFrames);
 
         if (m_spatialWriter.IsActive()) {
