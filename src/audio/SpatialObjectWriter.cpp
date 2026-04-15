@@ -17,7 +17,7 @@ namespace MagicSpatial {
 // unit sphere (|pos| ~= 1) except SUBBASS which is placed slightly grounded.
 const SpatialObjectWriter::ObjectPosition SpatialObjectWriter::kDefaultPositions[OBJ_COUNT] = {
     { 0.000f, -0.300f,  0.000f}, // OBJ_SUBBASS:     centre, grounded
-    { 0.000f,  0.000f, -0.700f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (intimate)
+    { 0.000f,  0.000f, -1.000f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (reference)
     {-0.500f,  0.000f, -0.866f}, // OBJ_LEFT:       -30° azimuth, 0° elevation
     { 0.500f,  0.000f, -0.866f}, // OBJ_RIGHT:      +30° azimuth, 0° elevation
     {-1.000f,  0.000f,  0.000f}, // OBJ_SIDE_LEFT:  -90° azimuth, 0° elevation
@@ -164,6 +164,17 @@ void SpatialObjectWriter::SetObjectPosition(ObjectSlot slot, float x, float y, f
     m_objects[slot].position = {x, y, z};
 }
 
+void SpatialObjectWriter::ResetObjectPositionsToReference() {
+    // Walk the canonical default-position table and write each one. Used by
+    // paths (e.g. ProcessMultichannelObjects) that want to wipe out any
+    // dynamic positioning a previous path (e.g. ProcessSpatialObjects)
+    // applied to OBJ_VOCAL/OBJ_LEFT/RIGHT/OBJ_TOP_*.
+    for (int i = 0; i < OBJ_COUNT; ++i) {
+        const auto& p = kDefaultPositions[i];
+        m_objects[i].position = {p.x, p.y, p.z};
+    }
+}
+
 void SpatialObjectWriter::Shutdown() {
     Log("[SpatialObjectWriter] Shutdown requested\n");
     m_shutdownRequested = true;
@@ -201,7 +212,31 @@ void SpatialObjectWriter::SubmitObjectAudio(ObjectSlot slot, const float* data, 
     if (buf.data.size() < frameCount) {
         buf.data.resize(frameCount);
     }
-    std::memcpy(buf.data.data(), data, frameCount * sizeof(float));
+    // Sanitize while copying: replace NaN/Inf with silence and SOFT-clip to
+    // ±1.0 with a smooth knee. Hard clipping of peaks from our aggressive
+    // band-gain paths (heights especially) produces harsh odd harmonics
+    // that sound like rhythmic electrical crackle in sync with loud content.
+    //
+    // Soft knee formula: linear for |v| ≤ threshold, smooth asymptote to
+    // ±1.0 above. At v = threshold, output = threshold (exact). At v → ∞,
+    // output → ±1.0. Cheap (one divide per out-of-range sample, zero cost
+    // for in-range samples).
+    constexpr float kClipThreshold = 0.9f;
+    constexpr float kClipKnee      = 1.0f - kClipThreshold; // 0.1
+    float* dst = buf.data.data();
+    for (uint32_t i = 0; i < frameCount; ++i) {
+        float v = data[i];
+        if (!std::isfinite(v)) {
+            v = 0.0f;
+        } else if (v > kClipThreshold) {
+            float over = v - kClipThreshold;
+            v = kClipThreshold + kClipKnee * over / (over + kClipKnee);
+        } else if (v < -kClipThreshold) {
+            float over = -v - kClipThreshold;
+            v = -kClipThreshold - kClipKnee * over / (over + kClipKnee);
+        }
+        dst[i] = v;
+    }
     buf.validFrames = frameCount;
     buf.hasNewData.store(true, std::memory_order_release);
 }

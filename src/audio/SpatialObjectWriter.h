@@ -69,6 +69,11 @@ public:
     // Update the 3D position of an object. Takes effect on the next render cycle.
     void SetObjectPosition(ObjectSlot slot, float x, float y, float z);
 
+    // Reset every object's position to its kDefaultPositions reference.
+    // Cheap (12 scalar writes); call at the top of any path that wants a
+    // clean slate after another path may have moved objects dynamically.
+    void ResetObjectPositionsToReference();
+
     void Shutdown();
 
 private:

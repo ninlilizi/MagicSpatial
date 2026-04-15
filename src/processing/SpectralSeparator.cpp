@@ -10,7 +10,15 @@ namespace {
     constexpr float kEps = 1e-12f;
     // Temporal smoothing time constant for the per-bin mask. Long enough to
     // kill musical noise, short enough to track vocal onsets.
-    constexpr float kMaskTauSeconds = 0.030f; // 30 ms
+    // Mask smoothing time constant. Longer = less frame-to-frame mask
+    // variation, which suppresses OLA-boundary artifacts. The mechanism:
+    // at the 93.75 Hz hop rate (48k / 512), per-frame mask changes modulate
+    // content amplitude, creating sidebands at freq ± 94 Hz around active
+    // frequencies. For a 3 kHz riff note this manifests as faint buzz
+    // "riding" on the note. 200 ms gives ~5% per-frame change — enough
+    // smoothing that the sidebands drop below audibility for typical
+    // music, while vocal onsets still respond in well under ¼ second.
+    constexpr float kMaskTauSeconds = 0.200f; // 200 ms (was 100, was 30)
 }
 
 void SpectralSeparator::Initialize(float sampleRate, uint32_t /*maxFrameCount*/) {
@@ -48,6 +56,7 @@ void SpectralSeparator::Initialize(float sampleRate, uint32_t /*maxFrameCount*/)
     m_fftBufR.assign(kFftSize, std::complex<float>(0.0f, 0.0f));
     m_fftBufC.assign(kFftSize, std::complex<float>(0.0f, 0.0f));
     m_smoothMask.assign(kNumBins, 0.0f);
+    m_frameMask.assign(kNumBins, 0.0f);
     m_accCenter.assign(kFftSize, 0.0f);
     m_readyCenter.assign(kHopSize * 2, 0.0f);
     m_delayL.assign(kFftSize, 0.0f);
@@ -56,6 +65,15 @@ void SpectralSeparator::Initialize(float sampleRate, uint32_t /*maxFrameCount*/)
     // --- Smoothing coefficient at frame rate ---
     float hopSeconds = static_cast<float>(kHopSize) / sampleRate;
     m_smoothAlpha = std::exp(-hopSeconds / kMaskTauSeconds);
+
+    // --- Bass-mask cutoff: bins covering [0, ~250 Hz) skip centre extraction ---
+    // FFT bin spacing = sampleRate / kFftSize. Computing the cutoff index by
+    // ceiling means we err on the side of preserving slightly more bass in
+    // residuals rather than slightly less in centre extraction.
+    constexpr float kBassCutoffHz = 250.0f;
+    float binSpacingHz = sampleRate / static_cast<float>(kFftSize);
+    m_bassMaskCutoffBin = static_cast<int>(std::ceil(kBassCutoffHz / binSpacingHz));
+    if (m_bassMaskCutoffBin > kNumBins) m_bassMaskCutoffBin = kNumBins;
 
     Reset();
 }
@@ -66,6 +84,7 @@ void SpectralSeparator::Reset() {
     std::fill(m_accCenter.begin(), m_accCenter.end(), 0.0f);
     std::fill(m_readyCenter.begin(), m_readyCenter.end(), 0.0f);
     std::fill(m_smoothMask.begin(), m_smoothMask.end(), 0.0f);
+    std::fill(m_frameMask.begin(), m_frameMask.end(), 0.0f);
     std::fill(m_delayL.begin(), m_delayL.end(), 0.0f);
     std::fill(m_delayR.begin(), m_delayR.end(), 0.0f);
     m_historyPos = 0;
@@ -125,33 +144,57 @@ void SpectralSeparator::ProcessFrame() {
     FFTForward(m_fftBufL.data());
     FFTForward(m_fftBufR.data());
 
-    // 3. Per-bin centre mask and extraction for unique bins [0, kNumBins).
-    //    phi   = 2·Re{L·conj(R)} / (|L|² + |R|²)   in [-1,1]  (phase alignment)
-    //    bal   = sqrt(min/max of energies)          in [0,1]   (amplitude match)
-    //    mask  = max(0, phi) · bal                              (centred confidence)
-    //    C(k)  = mask · (L + R) / 2                             (mono sum scaled by mask)
+    // 3a. Per-bin centre mask with temporal smoothing.
+    //     phi   = 2·Re{L·conj(R)} / (|L|² + |R|²)   in [-1,1]  (phase alignment)
+    //     bal   = sqrt(min/max of energies)          in [0,1]   (amplitude match)
+    //     mask  = max(0, phi) · bal                              (centred confidence)
     for (int k = 0; k < kNumBins; ++k) {
-        auto L = m_fftBufL[k];
-        auto R = m_fftBufR[k];
-        float ampL2 = L.real() * L.real() + L.imag() * L.imag();
-        float ampR2 = R.real() * R.real() + R.imag() * R.imag();
-        float crossRe = L.real() * R.real() + L.imag() * R.imag();
+        float raw;
+        if (k < m_bassMaskCutoffBin) {
+            // Bass bin — skip centre extraction so low frequencies stay in
+            // the residuals (and thus reach both front speakers as the
+            // original phantom image, preserving low-end punch).
+            raw = 0.0f;
+        } else {
+            auto L = m_fftBufL[k];
+            auto R = m_fftBufR[k];
+            float ampL2 = L.real() * L.real() + L.imag() * L.imag();
+            float ampR2 = R.real() * R.real() + R.imag() * R.imag();
+            float crossRe = L.real() * R.real() + L.imag() * R.imag();
 
-        float phi = 2.0f * crossRe / (ampL2 + ampR2 + kEps);
-        if (phi < 0.0f) phi = 0.0f;
+            float phi = 2.0f * crossRe / (ampL2 + ampR2 + kEps);
+            if (phi < 0.0f) phi = 0.0f;
 
-        float ampMin = (ampL2 < ampR2) ? ampL2 : ampR2;
-        float ampMax = (ampL2 > ampR2) ? ampL2 : ampR2;
-        float balance = std::sqrt(ampMin / (ampMax + kEps));
+            float ampMin = (ampL2 < ampR2) ? ampL2 : ampR2;
+            float ampMax = (ampL2 > ampR2) ? ampL2 : ampR2;
+            float balance = std::sqrt(ampMin / (ampMax + kEps));
 
-        float raw = phi * balance;
+            raw = phi * balance;
+        }
 
         // One-pole temporal smoothing at frame rate.
         m_smoothMask[k] = m_smoothAlpha * m_smoothMask[k] + (1.0f - m_smoothAlpha) * raw;
-        float mask = m_smoothMask[k];
+    }
 
-        std::complex<float> M = (L + R) * 0.5f;
-        m_fftBufC[k] = M * mask;
+    // 3b. Cross-bin [1, 2, 1]/4 smoothing of the mask. Reduces "musical noise"
+    //     where adjacent FFT bins with very different mask values produce
+    //     micro-discontinuities across frequency. Those discontinuities get
+    //     amplified in the residual (delayedL/R − centerMono) and manifest
+    //     as a faint content-tracking buzz in the upper-mid range.
+    m_frameMask[0] = 0.75f * m_smoothMask[0] + 0.25f * m_smoothMask[1];
+    for (int k = 1; k < kNumBins - 1; ++k) {
+        m_frameMask[k] = 0.25f * m_smoothMask[k - 1]
+                        + 0.5f  * m_smoothMask[k]
+                        + 0.25f * m_smoothMask[k + 1];
+    }
+    m_frameMask[kNumBins - 1] =
+        0.25f * m_smoothMask[kNumBins - 2] + 0.75f * m_smoothMask[kNumBins - 1];
+
+    // 3c. Apply the cross-bin-smoothed mask to build the centre-extraction
+    //     spectrum: C(k) = mask(k) · (L + R) / 2.
+    for (int k = 0; k < kNumBins; ++k) {
+        std::complex<float> M = (m_fftBufL[k] + m_fftBufR[k]) * 0.5f;
+        m_fftBufC[k] = M * m_frameMask[k];
     }
 
     // 4. Hermitian mirror the negative frequencies so the IFFT yields a real signal.

@@ -63,6 +63,21 @@ private:
     std::vector<float> m_smoothMask;                    // size kNumBins
     float m_smoothAlpha = 0.0f;                         // 0..1, closer to 1 = smoother
 
+    // First FFT bin whose centre frequency is at or above the bass-extract
+    // cutoff. Bins below this index have their mask forced to zero so bass
+    // content stays in the residual L/R streams (i.e. continues to play
+    // through both front speakers as the original phantom image) instead of
+    // being concentrated into OBJ_VOCAL — which would render through a
+    // single centre channel or phantom and sound noticeably thinner.
+    int m_bassMaskCutoffBin = 0;
+
+    // Per-frame mask after cross-bin smoothing (applied on top of the
+    // per-bin time smoothing). Cross-bin smoothing suppresses the classic
+    // "musical noise" artifact where adjacent FFT bins with very different
+    // mask values cause micro-discontinuities across frequency — audible
+    // as a faint content-tracking buzz in the residuals (delayedL/R − C).
+    std::vector<float> m_frameMask;                     // size kNumBins
+
     // Overlap-add accumulator for the centre output (size kFftSize, linear).
     std::vector<float> m_accCenter;
 
