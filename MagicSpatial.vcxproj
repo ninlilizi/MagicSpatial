@@ -99,6 +99,7 @@
     <ClCompile Include="src\vst\MagicSpatialVst.cpp" />
     <ClCompile Include="src\processing\Biquad.cpp" />
     <ClCompile Include="src\processing\Decorrelator.cpp" />
+    <ClCompile Include="src\processing\FeedbackDiffuser.cpp" />
     <ClCompile Include="src\processing\UpmixEngine.cpp" />
     <ClCompile Include="src\processing\StereoUpmixer.cpp" />
     <ClCompile Include="src\processing\EnhancedStereoUpmixer.cpp" />
@@ -121,6 +122,7 @@
     <ClInclude Include="src\processing\ChannelLayout.h" />
     <ClInclude Include="src\processing\Biquad.h" />
     <ClInclude Include="src\processing\Decorrelator.h" />
+    <ClInclude Include="src\processing\FeedbackDiffuser.h" />
     <ClInclude Include="src\processing\UpmixEngine.h" />
     <ClInclude Include="src\processing\StereoUpmixer.h" />
     <ClInclude Include="src\processing\EnhancedStereoUpmixer.h" />

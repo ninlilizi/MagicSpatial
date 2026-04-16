@@ -77,11 +77,14 @@ void SpectralSeparator::Initialize(float sampleRate, uint32_t /*maxFrameCount*/)
         m_varianceAlpha = std::exp(-hopSec / kVarianceTauSeconds);
     }
 
-    // --- Bass-mask cutoff: bins covering [0, ~250 Hz) skip centre extraction ---
-    // FFT bin spacing = sampleRate / kFftSize. Computing the cutoff index by
-    // ceiling means we err on the side of preserving slightly more bass in
-    // residuals rather than slightly less in centre extraction.
-    constexpr float kBassCutoffHz = 250.0f;
+    // --- Bass-mask cutoff: bins covering [0, ~120 Hz) skip centre extraction ---
+    // Below this frequency, the per-bin mask is forced to zero so bass stays
+    // in the residual L/R streams (playing through both front speakers as the
+    // original phantom image). Above it, centre-correlated content is
+    // extracted to OBJ_VOCAL. 120 Hz keeps sub-bass on the user's fronts
+    // (which typically reach 60 Hz) while allowing vocal fundamentals
+    // (120–250 Hz) through to the centre for a full-bodied image.
+    constexpr float kBassCutoffHz = 120.0f;
     float binSpacingHz = sampleRate / static_cast<float>(kFftSize);
     m_bassMaskCutoffBin = static_cast<int>(std::ceil(kBassCutoffHz / binSpacingHz));
     if (m_bassMaskCutoffBin > kNumBins) m_bassMaskCutoffBin = kNumBins;
