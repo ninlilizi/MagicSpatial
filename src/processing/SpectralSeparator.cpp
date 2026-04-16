@@ -66,6 +66,17 @@ void SpectralSeparator::Initialize(float sampleRate, uint32_t /*maxFrameCount*/)
     float hopSeconds = static_cast<float>(kHopSize) / sampleRate;
     m_smoothAlpha = std::exp(-hopSeconds / kMaskTauSeconds);
 
+    // --- Spectral-variance ambience tracking ---
+    m_binMean.assign(kNumBins, 0.0f);
+    m_binMeanSq.assign(kNumBins, 0.0f);
+    m_ambienceWeight.assign(kNumBins, 0.0f);
+    {
+        // ~500 ms time constant at the hop rate for stable variance estimate.
+        constexpr float kVarianceTauSeconds = 0.500f;
+        float hopSec = static_cast<float>(kHopSize) / sampleRate;
+        m_varianceAlpha = std::exp(-hopSec / kVarianceTauSeconds);
+    }
+
     // --- Bass-mask cutoff: bins covering [0, ~250 Hz) skip centre extraction ---
     // FFT bin spacing = sampleRate / kFftSize. Computing the cutoff index by
     // ceiling means we err on the side of preserving slightly more bass in
@@ -87,6 +98,9 @@ void SpectralSeparator::Reset() {
     std::fill(m_frameMask.begin(), m_frameMask.end(), 0.0f);
     std::fill(m_delayL.begin(), m_delayL.end(), 0.0f);
     std::fill(m_delayR.begin(), m_delayR.end(), 0.0f);
+    std::fill(m_binMean.begin(), m_binMean.end(), 0.0f);
+    std::fill(m_binMeanSq.begin(), m_binMeanSq.end(), 0.0f);
+    std::fill(m_ambienceWeight.begin(), m_ambienceWeight.end(), 0.0f);
     m_historyPos = 0;
     m_hopCounter = 0;
     m_readyRead = 0;
@@ -174,6 +188,28 @@ void SpectralSeparator::ProcessFrame() {
 
         // One-pole temporal smoothing at frame rate.
         m_smoothMask[k] = m_smoothAlpha * m_smoothMask[k] + (1.0f - m_smoothAlpha) * raw;
+    }
+
+    // 3a½. Per-bin spectral-variance ambience tracking.
+    //       Track running mean and mean-of-squares of |M(k)| (mid magnitude).
+    //       Bins with high coefficient of variation → ambient / reverberant;
+    //       low CV → steady-state / direct. Exposed via GetAmbienceWeights().
+    for (int k = 0; k < kNumBins; ++k) {
+        std::complex<float> M = (m_fftBufL[k] + m_fftBufR[k]) * 0.5f;
+        float mag = std::sqrt(M.real() * M.real() + M.imag() * M.imag());
+
+        m_binMean[k]   = m_varianceAlpha * m_binMean[k]   + (1.0f - m_varianceAlpha) * mag;
+        m_binMeanSq[k] = m_varianceAlpha * m_binMeanSq[k] + (1.0f - m_varianceAlpha) * mag * mag;
+
+        float variance = m_binMeanSq[k] - m_binMean[k] * m_binMean[k];
+        if (variance < 0.0f) variance = 0.0f;
+
+        // Coefficient of variation squared, normalized to [0,1].
+        // cv2 ~= 0 → steady tone, cv2 ~= 0.5+ → reverb/transient decay.
+        float cv2 = variance / (m_binMeanSq[k] + kEps);
+        float w = cv2 * 2.0f;
+        if (w > 1.0f) w = 1.0f;
+        m_ambienceWeight[k] = w;
     }
 
     // 3b. Cross-bin [1, 2, 1]/4 smoothing of the mask. Reduces "musical noise"

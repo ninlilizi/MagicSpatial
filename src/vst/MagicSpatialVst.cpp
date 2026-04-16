@@ -707,6 +707,32 @@ void MagicSpatialVst::InitSpatialDsp() {
     }
     m_mcDelayPos = 0;
 
+    // --- Feature 1: Early-reflection pre-delay (12 ms) ---
+    m_rearDelayLength = static_cast<int>(sr * static_cast<float>(kRearPreDelayMs) / 1000.0f);
+    if (m_rearDelayLength > kRearPreDelayMaxSamples)
+        m_rearDelayLength = kRearPreDelayMaxSamples;
+    if (m_rearDelayLength < 1)
+        m_rearDelayLength = 1;
+    for (int i = 0; i < 4; ++i)
+        m_rearDelayRing[i].assign(m_rearDelayLength, 0.0f);
+    m_rearDelaySidePos = 0;
+    m_rearDelayBackPos = 0;
+
+    // --- Feature 4: Feedback diffusion ---
+    for (int i = 0; i < 4; ++i)
+        m_rearDiffuser[i].Initialize(sr);
+
+    // --- Feature 3: Ambience bin counts per band ---
+    {
+        float binHz = sr / static_cast<float>(SpectralSeparator::kFftSize);
+        for (int b = 0; b < 4; ++b) m_ambBinCount[b] = 0;
+        for (int k = 0; k < SpectralSeparator::kNumBins; ++k) {
+            float freq = static_cast<float>(k) * binHz;
+            int band = (freq < 200.0f) ? 0 : (freq < 2000.0f) ? 1 : (freq < 8000.0f) ? 2 : 3;
+            m_ambBinCount[band]++;
+        }
+    }
+
     m_spatialDspInitialized = true;
 }
 
@@ -718,13 +744,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // not) and ensures consistency with the multichannel path.
     ApplySurroundPositionOverride();
 
-    // Spatial-extension attenuation (~-4.5 dB). Applied to the SURROUND,
-    // BACK, TOP_FRONT, and TOP_BACK feeds (and the surround-fold) at submit
-    // time so the room's acoustic sum from ~9 active speakers no longer
-    // overshoots the bypass level. The front-stage objects (LEFT, RIGHT,
-    // VOCAL, SUBBASS) deliberately bypass this so the perceived "weight" of
-    // the main image still matches bypass loudness.
-    constexpr float kSpatialExtGain = 0.60f;
+    // Feature 2: Correlation-adaptive spatial extension gain (replaces fixed
+    // 0.60). Computed after per-band correlation below — declared here so it
+    // is in scope for all four submit sites.
+    float spatialExtGain = 0.60f; // overwritten below after corr[] is computed
 
     const float* inL = inputs[0];
     const float* inR = inputs[1];
@@ -736,6 +759,20 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // downstream analysis runs on the delayed signals so nothing desyncs.
     m_spatialSeparator.Process(inL, inR, frames,
                                m_sDelayedL.data(), m_sDelayedR.data(), m_sCenter.data());
+
+    // Global output normalization: scale all three separator outputs so the
+    // total acoustic energy from ~8 active speakers matches the 2-speaker
+    // bypass level. Applied here at the source so every downstream path
+    // (residuals, band splits, side signals, all objects) inherits the
+    // attenuation automatically. Analysis passes (correlation, transients,
+    // brightness, pitch) all use energy ratios and are unaffected.
+    constexpr float kGlobalOutputGain = 0.65f;
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sDelayedL[i] *= kGlobalOutputGain;
+        m_sDelayedR[i] *= kGlobalOutputGain;
+        m_sCenter[i]   *= kGlobalOutputGain;
+    }
+
     const float* L = m_sDelayedL.data();
     const float* R = m_sDelayedR.data();
     const float* C = m_sCenter.data();
@@ -787,6 +824,21 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
     m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
 
+    // --- Feature 2: Correlation-adaptive spatial extension gain ---
+    // Average correlation across bands (weighted by perceptual importance) to
+    // modulate how aggressively spatial content wraps the listener. Reverberant
+    // recordings expand; dry studio mixes stay intimate.
+    {
+        float avgCorr = 0.25f * corr[0] + 0.35f * corr[1]
+                      + 0.25f * corr[2] + 0.15f * corr[3];
+        float targetGain = kSpatialExtGainMax
+                         - (avgCorr + 1.0f) * 0.5f * (kSpatialExtGainMax - kSpatialExtGainMin);
+        if (targetGain < kSpatialExtGainMin) targetGain = kSpatialExtGainMin;
+        if (targetGain > kSpatialExtGainMax) targetGain = kSpatialExtGainMax;
+        m_smoothSpatialExtGain += kSpatialExtGainSmoothing * (targetGain - m_smoothSpatialExtGain);
+        spatialExtGain = m_smoothSpatialExtGain;
+    }
+
     // --- Per-band sides (residual bands -> already centre-free) ---
     // All four bands precomputed so each spatial object can carry the full
     // bandwidth (and Dolby's bass management can then route low frequencies
@@ -796,6 +848,27 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_sSide1[i] = (bL1[i] - bR1[i]) * 0.5f;
         m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f;
         m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f;
+    }
+
+    // --- Feature 3: Per-band ambience factors from spectral variance ---
+    float ambFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    {
+        const float* ambW = m_spatialSeparator.GetAmbienceWeights();
+        float binHz = m_sampleRate / static_cast<float>(SpectralSeparator::kFftSize);
+        float ambSum[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int k = 0; k < SpectralSeparator::kNumBins; ++k) {
+            float freq = static_cast<float>(k) * binHz;
+            int band = (freq < 200.0f) ? 0 : (freq < 2000.0f) ? 1 : (freq < 8000.0f) ? 2 : 3;
+            ambSum[band] += ambW[k];
+        }
+        for (int b = 0; b < 4; ++b) {
+            float avg = ambSum[b] / static_cast<float>(m_ambBinCount[b] > 0 ? m_ambBinCount[b] : 1);
+            // Map ambience [0,1] to a boost factor [1.0, 1.3]: high ambience
+            // → up to +30% more routing to spatial extension objects.
+            float target = 1.0f + avg * 0.3f;
+            m_smoothAmbFactor[b] += kAmbFactorSmoothing * (target - m_smoothAmbFactor[b]);
+            ambFactor[b] = m_smoothAmbFactor[b];
+        }
     }
 
     // Dynamic L/R position steering: compute energy balance on the delayed mid
@@ -954,25 +1027,24 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_spatialDecorr[0].Process(m_sAmbL.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrL[i] += m_sScratch[i] * 3.50f * tDuck;
+                m_sSurrL[i] += m_sScratch[i] * 3.50f * ambFactor[1] * tDuck;
             }
             m_spatialDecorr[1].Process(m_sAmbR.data(), m_sScratch.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
                 float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrR[i] += m_sScratch[i] * 3.50f * tDuck;
+                m_sSurrR[i] += m_sScratch[i] * 3.50f * ambFactor[1] * tDuck;
             }
         }
 
         // Band 3 treble side (direct, no decorrelator — inverted for width)
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] += m_sSide3[i] * 3.75f * sw[3];
-            m_sSurrR[i] -= m_sSide3[i] * 3.75f * sw[3];
+            m_sSurrL[i] += m_sSide3[i] * 3.75f * ambFactor[3] * sw[3];
+            m_sSurrR[i] -= m_sSide3[i] * 3.75f * ambFactor[3] * sw[3];
         }
 
-        // Bands 0 + 2 fill (direct, modest gain — gives Dolby bass-manager
-        // and per-speaker crossover something to work with at every band).
+        // Bands 0 + 2 fill (direct, modest gain + ambience boost)
         for (uint32_t i = 0; i < frames; ++i) {
-            float fill = m_sSide0[i] * 1.50f + m_sSide2[i] * 1.50f;
+            float fill = m_sSide0[i] * 1.50f * ambFactor[0] + m_sSide2[i] * 1.50f * ambFactor[2];
             m_sSurrL[i] += fill;
             m_sSurrR[i] -= fill;
         }
@@ -1006,8 +1078,23 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
 
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] *= kSpatialExtGain;
-            m_sSurrR[i] *= kSpatialExtGain;
+            m_sSurrL[i] *= spatialExtGain;
+            m_sSurrR[i] *= spatialExtGain;
+        }
+        // Feature 1+4: pre-delay + diffusion on sides
+        {
+            int len = m_rearDelayLength;
+            for (uint32_t i = 0; i < frames; ++i) {
+                float tmpL = m_rearDelayRing[0][m_rearDelaySidePos];
+                float tmpR = m_rearDelayRing[1][m_rearDelaySidePos];
+                m_rearDelayRing[0][m_rearDelaySidePos] = m_sSurrL[i];
+                m_rearDelayRing[1][m_rearDelaySidePos] = m_sSurrR[i];
+                m_sSurrL[i] = tmpL;
+                m_sSurrR[i] = tmpR;
+                m_rearDelaySidePos = (m_rearDelaySidePos + 1) % len;
+            }
+            m_rearDiffuser[0].Process(m_sSurrL.data(), frames);
+            m_rearDiffuser[1].Process(m_sSurrR.data(), frames);
         }
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_LEFT, m_sSurrL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), frames);
@@ -1038,8 +1125,23 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
 
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] *= kSpatialExtGain;
-            m_sSurrR[i] *= kSpatialExtGain;
+            m_sSurrL[i] *= spatialExtGain;
+            m_sSurrR[i] *= spatialExtGain;
+        }
+        // Feature 1+4: pre-delay + diffusion on backs
+        {
+            int len = m_rearDelayLength;
+            for (uint32_t i = 0; i < frames; ++i) {
+                float tmpL = m_rearDelayRing[2][m_rearDelayBackPos];
+                float tmpR = m_rearDelayRing[3][m_rearDelayBackPos];
+                m_rearDelayRing[2][m_rearDelayBackPos] = m_sSurrL[i];
+                m_rearDelayRing[3][m_rearDelayBackPos] = m_sSurrR[i];
+                m_sSurrL[i] = tmpL;
+                m_sSurrR[i] = tmpR;
+                m_rearDelayBackPos = (m_rearDelayBackPos + 1) % len;
+            }
+            m_rearDiffuser[2].Process(m_sSurrL.data(), frames);
+            m_rearDiffuser[3].Process(m_sSurrR.data(), frames);
         }
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_LEFT, m_sSurrL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), frames);
@@ -1087,8 +1189,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
         m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sHeightL[i] *= kSpatialExtGain;
-            m_sHeightR[i] *= kSpatialExtGain;
+            m_sHeightL[i] *= spatialExtGain;
+            m_sHeightR[i] *= spatialExtGain;
         }
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), frames);
@@ -1110,8 +1212,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_spatialDecorr[6].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
             m_spatialDecorr[7].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
             for (uint32_t i = 0; i < frames; ++i) {
-                m_sHeightL[i] *= kSpatialExtGain;
-                m_sHeightR[i] *= kSpatialExtGain;
+                m_sHeightL[i] *= spatialExtGain;
+                m_sHeightR[i] *= spatialExtGain;
             }
             m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), frames);
             m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), frames);
@@ -1141,27 +1243,17 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 }
 
 // ============================================================================
-// Multichannel-to-Object promotion path (with stereo-aware extraction).
+// Multichannel-to-Object promotion path — zero DSP, zero latency.
 //
-// For 5.1, 7.1, and 7.1.4 (Passthrough) input, each channel is promoted to a
-// positioned Atmos object. Additionally, FL/FR are run through the spectral
-// separator to extract phantom centre from any stereo content mixed into the
-// front L/R channels (e.g. when a stereo video and a 5.1 game play at once —
-// Windows sums both into the endpoint's FL/FR). The extracted centre is added
-// to OBJ_VOCAL alongside the game's own C channel, so the video's vocals get
-// spatialized properly instead of staying stuck as front stereo.
+// For 5.1, 7.1, and 7.1.4 (Passthrough) input, each channel is promoted 1:1
+// to a positioned Atmos object at its ITU reference position. The Dolby
+// renderer then handles mapping onto whatever physical speakers exist.
 //
-// To keep everything time-aligned, channels 2-11 are delayed by kFftSize
-// samples — the same latency as the spectral separator — so the game's C,
-// LFE, and surround channels don't race ahead of the FL/FR residuals. The
-// result is a static ~21 ms latency on the entire multichannel path (same
-// as the stereo path), traded for proper stereo spatialization inside mixed
-// streams and a consistent audio feel across layout flips.
-//
-// Game directional cues are preserved: no decorrelation or spread is applied
-// to the game's non-FL/FR channels — they pass through unchanged at their
-// reference positions, so a left-of-screen sound effect still sounds firmly
-// left-of-screen.
+// No spectral separation, no delay, no remixing. Genuine multichannel content
+// (games, films) keeps its directional cues intact. Any stereo content that
+// Windows mixed into the front pair stays in OBJ_LEFT/OBJ_RIGHT unaltered —
+// the tradeoff: stereo apps lose spatial enhancement when a multichannel
+// source is active, but multichannel fidelity is preserved.
 // ============================================================================
 void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs,
                                                   VstInt32 sampleFrames, InputLayout layout) {
@@ -1179,54 +1271,7 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
     m_spatialWriter.ResetObjectPositionsToReference();
     ApplySurroundPositionOverride();
 
-    // --- Step 1: Spectral centre extraction on FL/FR ---
-    // Produces delayed FL/FR (kFftSize latency) and the per-bin extracted
-    // phantom-centre stream. Works identically whether FL/FR carry pure
-    // game stereo or video-mixed-into-game — the separator finds whatever
-    // centre-correlated content exists.
-    m_spatialSeparator.Process(inputs[0], inputs[1], frames,
-                               m_sDelayedL.data(), m_sDelayedR.data(), m_sCenter.data());
-
-    // --- Step 2: Delay channels 2..11 by kFftSize to stay time-aligned ---
-    // Per-channel ring buffer + fetch-then-store pattern gives exact delay.
-    // All channels share m_mcDelayPos so their reads/writes happen at the
-    // same ring position every sample.
-    {
-        const int bufSize = kMcDelaySize;
-        for (int ch = 2; ch < kNumInputs; ++ch) {
-            auto& ring = m_mcDelayRing[ch];
-            float* out = m_mcDelayed[ch].data();
-            const float* in = inputs[ch];
-            for (uint32_t i = 0; i < frames; ++i) {
-                int pos = (m_mcDelayPos + i) % bufSize;
-                out[i] = ring[pos];
-                ring[pos] = in[i];
-            }
-        }
-        m_mcDelayPos = (m_mcDelayPos + static_cast<int>(frames)) % kMcDelaySize;
-    }
-
-    // --- Step 3: Residuals for FL/FR, and vocal mix for the centre object ---
-    // residualL/R = delayedL/R - extracted centre  (non-centred content only)
-    // vocalMix    = delayedC    + extracted centre (game C + video vocal)
-    for (uint32_t i = 0; i < frames; ++i) {
-        m_sResidualL[i] = m_sDelayedL[i] - m_sCenter[i];
-        m_sResidualR[i] = m_sDelayedR[i] - m_sCenter[i];
-    }
-    // Vocal mix computed into m_sScratch (unused in the multichannel path).
-    // Scale by 0.7 to give headroom when BOTH sources contribute: game C
-    // (dialogue) AND extracted phantom centre from FL/FR (e.g. a stereo
-    // video's vocal) can each be loud. Without headroom, their sum sits
-    // almost continuously above the soft-clip threshold, producing steady
-    // harmonic distortion perceived as a faint persistent crackle. 0.7x
-    // (-3 dB) each gives the sum ~1.4 peak budget before clipping engages,
-    // enough to accommodate simultaneous loud content without audible
-    // distortion on typical peaks.
-    for (uint32_t i = 0; i < frames; ++i) {
-        m_sScratch[i] = (m_mcDelayed[2][i] + m_sCenter[i]) * 0.7f;
-    }
-
-    // --- Step 4: Submit every slot; silence for ones the layout doesn't feed ---
+    // --- Submit each input channel directly to its Atmos object slot ---
     bool fed[SpatialObjectWriter::OBJ_COUNT] = { false };
     auto submit = [&](SpatialObjectWriter::ObjectSlot slot, const float* data) {
         m_spatialWriter.SubmitObjectAudio(slot, data, frames);
@@ -1238,49 +1283,46 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
         case InputLayout::Surround51:
             // 6 channels: [0]FL [1]FR [2]C [3]LFE [4]SL [5]SR
             inputChannelCount = 6;
-            submit(SpatialObjectWriter::OBJ_LEFT,       m_sResidualL.data());
-            submit(SpatialObjectWriter::OBJ_RIGHT,      m_sResidualR.data());
-            submit(SpatialObjectWriter::OBJ_VOCAL,      m_sScratch.data());      // delayed C + centerMono
-            submit(SpatialObjectWriter::OBJ_SUBBASS,    m_mcDelayed[3].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_mcDelayed[4].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_mcDelayed[5].data());
+            submit(SpatialObjectWriter::OBJ_LEFT,       inputs[0]);
+            submit(SpatialObjectWriter::OBJ_RIGHT,      inputs[1]);
+            submit(SpatialObjectWriter::OBJ_VOCAL,      inputs[2]);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,    inputs[3]);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  inputs[4]);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, inputs[5]);
             break;
 
         case InputLayout::Surround71:
             // 8 channels: [0]FL [1]FR [2]C [3]LFE [4]BL [5]BR [6]SL [7]SR
-            // (Note: BL/BR before SL/SR — opposite of Passthrough order.)
             inputChannelCount = 8;
-            submit(SpatialObjectWriter::OBJ_LEFT,       m_sResidualL.data());
-            submit(SpatialObjectWriter::OBJ_RIGHT,      m_sResidualR.data());
-            submit(SpatialObjectWriter::OBJ_VOCAL,      m_sScratch.data());
-            submit(SpatialObjectWriter::OBJ_SUBBASS,    m_mcDelayed[3].data());
-            submit(SpatialObjectWriter::OBJ_BACK_LEFT,  m_mcDelayed[4].data());
-            submit(SpatialObjectWriter::OBJ_BACK_RIGHT, m_mcDelayed[5].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_mcDelayed[6].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_mcDelayed[7].data());
+            submit(SpatialObjectWriter::OBJ_LEFT,       inputs[0]);
+            submit(SpatialObjectWriter::OBJ_RIGHT,      inputs[1]);
+            submit(SpatialObjectWriter::OBJ_VOCAL,      inputs[2]);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,    inputs[3]);
+            submit(SpatialObjectWriter::OBJ_BACK_LEFT,  inputs[4]);
+            submit(SpatialObjectWriter::OBJ_BACK_RIGHT, inputs[5]);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  inputs[6]);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, inputs[7]);
             break;
 
         case InputLayout::Passthrough:
             // 12 channels in AtmosChannel order:
             // [0]FL [1]FR [2]C [3]LFE [4]SL [5]SR [6]BL [7]BR [8]TFL [9]TFR [10]TBL [11]TBR
-            // (Note: SL/SR before BL/BR — opposite of Surround71 order.)
             inputChannelCount = 12;
-            submit(SpatialObjectWriter::OBJ_LEFT,        m_sResidualL.data());
-            submit(SpatialObjectWriter::OBJ_RIGHT,       m_sResidualR.data());
-            submit(SpatialObjectWriter::OBJ_VOCAL,       m_sScratch.data());
-            submit(SpatialObjectWriter::OBJ_SUBBASS,     m_mcDelayed[3].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,   m_mcDelayed[4].data());
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT,  m_mcDelayed[5].data());
-            submit(SpatialObjectWriter::OBJ_BACK_LEFT,   m_mcDelayed[6].data());
-            submit(SpatialObjectWriter::OBJ_BACK_RIGHT,  m_mcDelayed[7].data());
-            submit(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_mcDelayed[8].data());
-            submit(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_mcDelayed[9].data());
-            submit(SpatialObjectWriter::OBJ_TOP_BACK_L,  m_mcDelayed[10].data());
-            submit(SpatialObjectWriter::OBJ_TOP_BACK_R,  m_mcDelayed[11].data());
+            submit(SpatialObjectWriter::OBJ_LEFT,        inputs[0]);
+            submit(SpatialObjectWriter::OBJ_RIGHT,       inputs[1]);
+            submit(SpatialObjectWriter::OBJ_VOCAL,       inputs[2]);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,     inputs[3]);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,   inputs[4]);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT,  inputs[5]);
+            submit(SpatialObjectWriter::OBJ_BACK_LEFT,   inputs[6]);
+            submit(SpatialObjectWriter::OBJ_BACK_RIGHT,  inputs[7]);
+            submit(SpatialObjectWriter::OBJ_TOP_FRONT_L, inputs[8]);
+            submit(SpatialObjectWriter::OBJ_TOP_FRONT_R, inputs[9]);
+            submit(SpatialObjectWriter::OBJ_TOP_BACK_L,  inputs[10]);
+            submit(SpatialObjectWriter::OBJ_TOP_BACK_R,  inputs[11]);
             break;
 
         default:
-            // Stereo or Unknown — should never reach here; dispatcher gates this.
             return;
     }
 
@@ -1292,13 +1334,9 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
         }
     }
 
-    // 1:1 channel-passthrough fallback. We write the DELAYED signals (not raw
-    // inputs) so the fallback stays time-aligned with the object output during
-    // the transient window when m_spatialWriter.IsActive() flips.
-    std::memcpy(outputs[0], m_sDelayedL.data(), sampleFrames * sizeof(float));
-    std::memcpy(outputs[1], m_sDelayedR.data(), sampleFrames * sizeof(float));
-    for (int ch = 2; ch < inputChannelCount && ch < kAtmosChannelCount; ++ch) {
-        std::memcpy(outputs[ch], m_mcDelayed[ch].data(), sampleFrames * sizeof(float));
+    // 1:1 channel-passthrough fallback (raw inputs — no delay since no DSP).
+    for (int ch = 0; ch < inputChannelCount && ch < kAtmosChannelCount; ++ch) {
+        std::memcpy(outputs[ch], inputs[ch], sampleFrames * sizeof(float));
     }
     for (int ch = inputChannelCount; ch < kAtmosChannelCount; ++ch) {
         std::memset(outputs[ch], 0, sampleFrames * sizeof(float));

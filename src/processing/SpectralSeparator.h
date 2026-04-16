@@ -71,6 +71,22 @@ private:
     // single centre channel or phantom and sound noticeably thinner.
     int m_bassMaskCutoffBin = 0;
 
+    // --- Spectral-variance ambience tracking ---
+    // Per-bin running mean and mean-of-squares of the mid-channel magnitude.
+    // Variance = E[X²] - E[X]² gives a coefficient of variation that
+    // distinguishes reverb tails / ambient content (high variance) from
+    // steady-state direct signal (low variance).
+    std::vector<float> m_binMean;            // size kNumBins
+    std::vector<float> m_binMeanSq;          // size kNumBins
+    std::vector<float> m_ambienceWeight;     // size kNumBins, normalized [0,1]
+    float m_varianceAlpha = 0.0f;            // smoothing (e.g. ~500 ms tau)
+
+public:
+    // Per-bin ambience weights [0..1], valid after Process(). Size = kNumBins.
+    const float* GetAmbienceWeights() const { return m_ambienceWeight.data(); }
+
+private:
+
     // Per-frame mask after cross-bin smoothing (applied on top of the
     // per-bin time smoothing). Cross-bin smoothing suppresses the classic
     // "musical noise" artifact where adjacent FFT bins with very different

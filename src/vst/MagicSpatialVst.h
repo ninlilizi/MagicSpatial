@@ -10,6 +10,7 @@
 #include "processing/TransientDetector.h"
 #include "processing/StereoCorrelationAnalyzer.h"
 #include "processing/Decorrelator.h"
+#include "processing/FeedbackDiffuser.h"
 #include "processing/Biquad.h"
 #include "audio/SpatialObjectWriter.h"
 #include "core/Types.h"
@@ -148,6 +149,30 @@ private:
     // weighting, so it cannot mute the rear channels.
     float m_smoothBalance = 0.0f;
     static constexpr float kBalanceSmoothing = 0.06f; // ~120ms ramp at block rate
+
+    // --- Feature 1: Early-reflection pre-delay on rear objects ---
+    // 12 ms ring-buffer delay applied to OBJ_SIDE and OBJ_BACK before submit,
+    // creating a perceptual gap between direct front image and surround wash.
+    static constexpr int kRearPreDelayMs = 12;
+    static constexpr int kRearPreDelayMaxSamples = 1024; // >= ceil(15ms @ 48k)
+    std::vector<float> m_rearDelayRing[4]; // [0]=sideL [1]=sideR [2]=backL [3]=backR
+    int m_rearDelayLength = 0;
+    int m_rearDelaySidePos = 0;
+    int m_rearDelayBackPos = 0;
+
+    // --- Feature 4: Feedback diffusion on rear objects ---
+    FeedbackDiffuser m_rearDiffuser[4]; // [0]=sideL [1]=sideR [2]=backL [3]=backR
+
+    // --- Feature 2: Correlation-adaptive spatial extension gain ---
+    float m_smoothSpatialExtGain = 0.60f;
+    static constexpr float kSpatialExtGainSmoothing = 0.04f; // ~200 ms ramp
+    static constexpr float kSpatialExtGainMin = 0.45f;
+    static constexpr float kSpatialExtGainMax = 0.75f;
+
+    // --- Feature 3: Spectral-variance ambience extraction ---
+    int m_ambBinCount[4] = {0, 0, 0, 0};        // precomputed bin counts per band
+    float m_smoothAmbFactor[4] = {0.f, 0.f, 0.f, 0.f};
+    static constexpr float kAmbFactorSmoothing = 0.06f;
 
     void InitSpatialDsp();
     void ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames);
