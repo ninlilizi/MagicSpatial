@@ -535,20 +535,24 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
     InputLayout targetLayout;
     if (m_paramMode < 0.125f) {
         InputLayout raw = DetectLayoutFromInputs(inputs, sampleFrames);
+        int hysteresisSamples = static_cast<int>(m_sampleRate * kLayoutHysteresisMs / 1000.0f);
         if (raw == m_committedLayout) {
             // Raw matches the committed layout — reset any pending change.
             m_pendingLayout = raw;
-            m_pendingCount = 0;
+            m_pendingSamples = 0;
         } else if (raw == m_pendingLayout) {
-            // Consistent with what we're watching — accumulate evidence.
-            if (++m_pendingCount >= kLayoutHysteresisBlocks) {
+            // Consistent with what we're watching — accumulate evidence in
+            // samples (time-based, so responsiveness is stable across host
+            // block sizes).
+            m_pendingSamples += sampleFrames;
+            if (m_pendingSamples >= hysteresisSamples) {
                 m_committedLayout = m_pendingLayout;
-                m_pendingCount = 0;
+                m_pendingSamples = 0;
             }
         } else {
             // A third value appeared — reset and start counting from this one.
             m_pendingLayout = raw;
-            m_pendingCount = 1;
+            m_pendingSamples = sampleFrames;
         }
         targetLayout = m_committedLayout;
     }

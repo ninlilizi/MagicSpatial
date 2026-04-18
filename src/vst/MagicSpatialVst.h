@@ -97,8 +97,11 @@ private:
     // otherwise cause DSP-state discontinuities perceived as crackles.
     InputLayout m_committedLayout = InputLayout::Stereo;
     InputLayout m_pendingLayout   = InputLayout::Stereo;
-    int m_pendingCount = 0;
-    static constexpr int kLayoutHysteresisBlocks = 20; // ~200 ms at typical block sizes
+    int m_pendingSamples = 0; // samples of consistent pending-layout evidence
+    // Time-based hysteresis: commit to a new layout after this many samples of
+    // consistent detection. Keeps responsiveness stable across host block sizes
+    // (20-block constant drifted between 53 ms @ 128-sample and 1.7 s @ 4096).
+    static constexpr int kLayoutHysteresisMs = 200;
 
     // In-process spatial object output via ISpatialAudioClient
     SpatialObjectWriter m_spatialWriter;
