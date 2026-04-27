@@ -14,7 +14,7 @@ namespace {
 
     // Damping cutoff — 1-pole lowpass target frequency.  Each feedback
     // iteration loses energy above this, simulating air/wall absorption.
-    constexpr float kDampCutoffHz = 6000.0f;
+    constexpr float kDampCutoffHz = 2800.0f;
 }
 
 void FeedbackDiffuser::Initialize(float sampleRate) {
