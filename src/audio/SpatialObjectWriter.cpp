@@ -213,17 +213,23 @@ void SpatialObjectWriter::SubmitObjectAudio(ObjectSlot slot, const float* data, 
     // for in-range samples).
     constexpr float kClipThreshold = 0.9f;
     constexpr float kClipKnee      = 1.0f - kClipThreshold; // 0.1
+    // Master gain is applied BEFORE the soft knee so any boost-induced overload
+    // is absorbed by the same smooth limiter rather than hard-clipping.
+    const float gain = m_masterGain.load(std::memory_order_relaxed);
     float* dst = buf.data.data();
     for (uint32_t i = 0; i < frameCount; ++i) {
         float v = data[i];
         if (!std::isfinite(v)) {
             v = 0.0f;
-        } else if (v > kClipThreshold) {
-            float over = v - kClipThreshold;
-            v = kClipThreshold + kClipKnee * over / (over + kClipKnee);
-        } else if (v < -kClipThreshold) {
-            float over = -v - kClipThreshold;
-            v = -kClipThreshold - kClipKnee * over / (over + kClipKnee);
+        } else {
+            v *= gain;
+            if (v > kClipThreshold) {
+                float over = v - kClipThreshold;
+                v = kClipThreshold + kClipKnee * over / (over + kClipKnee);
+            } else if (v < -kClipThreshold) {
+                float over = -v - kClipThreshold;
+                v = -kClipThreshold - kClipKnee * over / (over + kClipKnee);
+            }
         }
         dst[i] = v;
     }
@@ -243,35 +249,28 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
 
     Log("[SpatialObjectWriter] Background thread started, activating spatial audio...\n");
 
-    // Outer (re)activation loop. The default endpoint can be torn down and
-    // rebuilt beneath us — monitor standby/wake, exclusive-mode handoff, GPU
-    // re-enumeration. Rather than expiring on the first invalidation (which
-    // left the writer permanently inert until a plugin reload), we release the
-    // stale stream and retry until the device returns or shutdown is asked.
-    // While inactive, IsActive() reports false so the plugin falls back to its
-    // channel-based path with no break in playback.
-    while (!m_shutdownRequested) {
-        if (!ActivateSpatialAudio()) {
-            TeardownStream();
-            m_active = false;
-            if (m_shutdownRequested) break;
-            Log("[SpatialObjectWriter] Activation failed; retrying shortly.\n");
-            for (int i = 0; i < 25 && !m_shutdownRequested; ++i) Sleep(200); // ~5s
-            continue;
-        }
-
-        Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
-        m_active = true;
-
-        bool invalidated = RenderLoop();
-
+    // A SINGLE activation attempt. If it fails — most commonly because another
+    // plugin instance (E-APO loads the plugin once for its editor view and
+    // again in the audio engine) already holds the one spatial render stream —
+    // we give up and let this instance fall back to its channel-based output.
+    // Retrying in a loop here makes the two instances fight over the stream
+    // endlessly, which manifests as unstable or absent spatial audio.
+    if (!ActivateSpatialAudio()) {
+        Log("[SpatialObjectWriter] Spatial audio activation FAILED\n");
+        m_failed = true;
         m_active = false;
         TeardownStream();
-
-        if (!invalidated) break;  // clean shutdown — leave the thread for good
-        Log("[SpatialObjectWriter] Device invalidated; re-activating when it returns.\n");
+        CoUninitialize();
+        return;
     }
 
+    Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
+    m_active = true;
+
+    RenderLoop();
+
+    m_active = false;
+    TeardownStream();
     CoUninitialize();
 }
 
@@ -413,7 +412,7 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
     return true;
 }
 
-bool SpatialObjectWriter::RenderLoop() {
+void SpatialObjectWriter::RenderLoop() {
     while (!m_shutdownRequested) {
         DWORD waitResult = WaitForSingleObject(m_renderEvent, 500);
         if (m_shutdownRequested) break;
@@ -425,7 +424,7 @@ bool SpatialObjectWriter::RenderLoop() {
         if (FAILED(hr)) {
             if (hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED) {
                 Log("[SpatialObjectWriter] Resources invalidated\n");
-                return true;  // device gone — let the thread re-activate
+                break;  // device gone — exit; plugin falls back to channels
             }
             continue;
         }
@@ -485,13 +484,12 @@ bool SpatialObjectWriter::RenderLoop() {
         if (FAILED(hr)) {
             if (hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED) {
                 Log("[SpatialObjectWriter] Resources invalidated on EndUpdating\n");
-                return true;
+                break;
             }
             Log("[SpatialObjectWriter] EndUpdatingAudioObjects failed: 0x%08lX\n",
                 static_cast<unsigned long>(hr));
         }
     }
-    return false;  // shutdown requested
 }
 
 } // namespace MagicSpatial

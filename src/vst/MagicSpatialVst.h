@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <atomic>
 #include <string>
 #include "vst/VstDefs.h"
 #include "processing/UpmixEngine.h"
@@ -39,7 +40,7 @@ class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
     static constexpr int kNumOutputs = 12;
-    static constexpr int kNumParams  = 3;
+    static constexpr int kNumParams  = 4;
 
     static constexpr VstInt32 kUniqueID = 'MgSp';
 
@@ -58,9 +59,18 @@ public:
 
 private:
     void UpdateEngine();
+    // Spawns the spatial writer on first audio processing. Deferred out of
+    // effOpen so that ONLY the audio-engine instance activates spatial audio —
+    // E-APO also loads the plugin in its editor GUI process, and a second
+    // writer there would contend for the single per-endpoint spatial stream.
+    void EnsureSpatialWriterStarted();
     InputLayout DetectLayoutFromInputs(float** inputs, VstInt32 sampleFrames);
     SpeakerLayout SpeakerLayoutFromParam() const;
     void ZeroUnusedChannels(float** outputs, VstInt32 sampleFrames, SpeakerLayout layout);
+    // Linear multiplier derived from m_paramMasterGain (1.0 at the 0.5 centre).
+    float MasterGainLinear() const;
+    // Scale every output channel by the master gain (unity = cheap no-op).
+    void ApplyMasterGainToOutputs(float** outputs, VstInt32 sampleFrames);
     void EditorRedraw();
 
     AEffect m_effect{};
@@ -80,6 +90,14 @@ private:
     // that's the most common atypical setup we want to fix; users with true
     // side surrounds can switch back to Side.
     float m_paramSurroundPos = 1.0f;  // Rear (default)
+
+    // Master output gain (shared-mode only). Normalized 0..1 maps linearly to
+    // -12..+12 dB with 0.5 = unity (0 dB), so the default is a true no-op that
+    // preserves the existing sound. Applied to every path we emit: spatial
+    // objects (via SpatialObjectWriter::SetMasterGain, soft-clipped) and the
+    // channel-based fallback outputs. Has NO effect on exclusive-mode or
+    // bitstream-passthrough audio, which bypasses the Windows mixer entirely.
+    float m_paramMasterGain = 0.5f;
 
     // Processing state
     UpmixEngine m_engine;
@@ -105,7 +123,10 @@ private:
 
     // In-process spatial object output via ISpatialAudioClient
     SpatialObjectWriter m_spatialWriter;
-    bool m_spatialInitAttempted = false;
+    // Guards one-time spawn of the spatial writer. Atomic because it is touched
+    // from both the control thread (effMainsChanged) and the audio thread
+    // (ProcessReplacing) — whichever processing signal arrives first.
+    std::atomic<bool> m_spatialInitAttempted{false};
 
     // Spatial decomposition DSP (used when spatial objects are active)
     SpectralSeparator m_spatialSeparator;

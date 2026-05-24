@@ -26,6 +26,11 @@ inline FILE* GetLogFile() {
 inline void LogMsg(const char* fmt, ...) {
     FILE* f = GetLogFile();
     if (!f) return;
+    // Prefix every line with the process ID so we can tell whether E-APO's
+    // multiple plugin instances share a process (audiodg) or are split across
+    // the editor GUI and the audio engine — which decides whether a single
+    // shared ISpatialAudioClient is even possible.
+    std::fprintf(f, "[pid %lu] ", static_cast<unsigned long>(GetCurrentProcessId()));
     va_list args;
     va_start(args, fmt);
     std::vfprintf(f, fmt, args);

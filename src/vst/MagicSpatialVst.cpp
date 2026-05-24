@@ -21,7 +21,13 @@ enum EditorCtrlID {
     ID_SPEAKERS_COMBO     = 1002,
     ID_SURROUND_POS_LABEL = 1003,
     ID_SURROUND_POS_COMBO = 1004,
+    ID_GAIN_LABEL         = 1005,
+    ID_GAIN_SLIDER        = 1006,
 };
+
+// Master-gain parameter mapping. Normalized 0..1 ↔ -12..+12 dB, 0.5 = unity.
+static constexpr float kGainRangeDb = 24.0f; // total span (±12 dB)
+static inline float GainNormToDb(float norm) { return (norm - 0.5f) * kGainRangeDb; }
 
 // Helper: show or hide the SurroundPos combo + label based on the current
 // speakers parameter. Only relevant for 5.1 / 5.1.2 / 5.1.4 layouts where the
@@ -63,6 +69,22 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             else if (id == ID_SURROUND_POS_COMBO) {
                 // sel: 0 = Side, 1 = Rear
                 plugin->m_paramSurroundPos = (sel == 0) ? 0.0f : 1.0f;
+            }
+        }
+        return 0;
+
+    case WM_HSCROLL:
+        // The master-volume trackbar. Like the combos, it writes straight to
+        // the live parameter member (no audioMasterAutomate — see note above).
+        if (plugin) {
+            HWND ctrl = reinterpret_cast<HWND>(lParam);
+            if (ctrl && GetDlgCtrlID(ctrl) == ID_GAIN_SLIDER) {
+                int pos = static_cast<int>(SendMessageW(ctrl, TBM_GETPOS, 0, 0));
+                plugin->m_paramMasterGain = std::clamp(pos / 240.0f, 0.0f, 1.0f);
+                wchar_t txt[32];
+                swprintf(txt, 32, L"Volume: %+.1f dB",
+                         GainNormToDb(plugin->m_paramMasterGain));
+                if (HWND lbl = GetDlgItem(hwnd, ID_GAIN_LABEL)) SetWindowTextW(lbl, txt);
             }
         }
         return 0;
@@ -147,13 +169,13 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
 {
     switch (opcode) {
     case effOpen:
-        // Attempt spatial audio activation
-        if (!m_spatialInitAttempted) {
-            m_spatialInitAttempted = true;
-            m_spatialWriter.Initialize();
-            LogMsg("effOpen: SpatialObjectWriter Initialize called\n");
-        }
-
+        // Deliberately do NOT activate spatial audio here. E-APO loads the
+        // plugin in BOTH its editor GUI process and the audio engine; if the
+        // editor instance spawned a writer it would contend with the engine
+        // for the single per-endpoint spatial stream. The writer is instead
+        // started on first real processing (see EnsureSpatialWriterStarted),
+        // which the editor instance never reaches.
+        LogMsg("effOpen\n");
         return 0;
 
     case effClose:
@@ -181,7 +203,14 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         return 0;
 
     case effMainsChanged:
-        if (value == 0) m_engine.Reset();
+        if (value != 0) {
+            // Resume = this instance is about to process audio, so it is the
+            // real audio-engine instance. Safe place (control thread, not the
+            // audio thread) to spawn the spatial writer.
+            EnsureSpatialWriterStarted();
+        } else {
+            m_engine.Reset();
+        }
         return 0;
 
     case effEditGetRect:
@@ -293,6 +322,27 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
 
         // Match initial visibility to the speakers selection.
         UpdateSurroundPosVisibility(hwnd, m_paramSpeakers);
+        y += 30;
+
+        // --- Master Volume (shared-mode output gain) ---
+        // Continuous -12..+12 dB trim on everything we emit. Helpful when
+        // shared-mode Atmos arrives quieter than stereo. Does NOT touch
+        // exclusive-mode / bitstream passthrough, which bypass the mixer.
+        wchar_t gainText[32];
+        swprintf(gainText, 32, L"Volume: %+.1f dB", GainNormToDb(m_paramMasterGain));
+        CreateWindowW(L"STATIC", gainText,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, y, w - 20, 18, hwnd,
+            reinterpret_cast<HMENU>(ID_GAIN_LABEL), hInst, nullptr);
+        y += 20;
+        HWND gainSlider = CreateWindowW(TRACKBAR_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+            10, y, w - 20, 28, hwnd,
+            reinterpret_cast<HMENU>(ID_GAIN_SLIDER), hInst, nullptr);
+        SendMessageW(gainSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 240));
+        SendMessageW(gainSlider, TBM_SETPAGESIZE, 0, 12); // ~1.2 dB per page
+        SendMessageW(gainSlider, TBM_SETPOS, TRUE,
+            static_cast<LPARAM>(m_paramMasterGain * 240.0f + 0.5f));
 
         return 1;
     }
@@ -329,6 +379,7 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             case 0: std::strncpy(buf, "Mode",        kVstMaxParamStrLen); break;
             case 1: std::strncpy(buf, "Speakers",    kVstMaxParamStrLen); break;
             case 2: std::strncpy(buf, "SurroundPos", kVstMaxParamStrLen); break;
+            case 3: std::strncpy(buf, "Volume",      kVstMaxParamStrLen); break;
             }
         }
         return 0;
@@ -361,6 +412,10 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
                 if (m_paramSurroundPos < 0.5f) std::strncpy(buf, "Side", kVstMaxParamStrLen);
                 else                           std::strncpy(buf, "Rear", kVstMaxParamStrLen);
                 break;
+            case 3:
+                std::snprintf(buf, kVstMaxParamStrLen, "%+.1f dB",
+                              GainNormToDb(m_paramMasterGain));
+                break;
             }
         }
         return 0;
@@ -389,6 +444,9 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
     case 2:
         m_paramSurroundPos = value;
         break;
+    case 3:
+        m_paramMasterGain = value;
+        break;
     }
 }
 
@@ -397,7 +455,22 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     case 0: return m_paramMode;
     case 1: return m_paramSpeakers;
     case 2: return m_paramSurroundPos;
+    case 3: return m_paramMasterGain;
     default: return 0.0f;
+    }
+}
+
+float MagicSpatialVst::MasterGainLinear() const {
+    return std::pow(10.0f, GainNormToDb(m_paramMasterGain) / 20.0f);
+}
+
+void MagicSpatialVst::ApplyMasterGainToOutputs(float** outputs, VstInt32 sampleFrames) {
+    const float g = MasterGainLinear();
+    if (g == 1.0f) return;  // unity — nothing to do
+    for (int ch = 0; ch < kNumOutputs; ++ch) {
+        float* out = outputs[ch];
+        if (!out) continue;
+        for (VstInt32 i = 0; i < sampleFrames; ++i) out[i] *= g;
     }
 }
 
@@ -500,6 +573,11 @@ void MagicSpatialVst::ZeroUnusedChannels(float** outputs, VstInt32 sampleFrames,
 void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32 sampleFrames) {
     if (sampleFrames <= 0) return;
 
+    // Safety net: if the host never sent effMainsChanged(resume), start the
+    // writer on the first real audio block. Only this (the audio-engine)
+    // instance ever reaches here; the editor instance does not process audio.
+    EnsureSpatialWriterStarted();
+
     // --- Crackle defenses on audio-thread entry ---
     //
     // 1) Enable flush-to-zero (FTZ) and denormals-are-zero (DAZ) on the SSE
@@ -525,6 +603,11 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
             if (!std::isfinite(in[i])) in[i] = 0.0f;
         }
     }
+
+    // Hand the master gain to the spatial writer for this block. It applies it
+    // (with soft-clip) to every object's audio inside SubmitObjectAudio. The
+    // channel-based paths below apply the same gain to their outputs directly.
+    m_spatialWriter.SetMasterGain(MasterGainLinear());
 
     // Detect input layout first — needed to decide spatial vs channel path.
     // In Auto mode, apply hysteresis: the committed layout only changes after
@@ -588,6 +671,10 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
             for (int ch = 0; ch < kAtmosChannelCount; ++ch) {
                 std::memset(outputs[ch], 0, sampleFrames * sizeof(float));
             }
+        } else {
+            // Writer still warming up — ProcessSpatialObjects wrote a channel
+            // fallback into outputs, so apply the master gain to it here.
+            ApplyMasterGainToOutputs(outputs, sampleFrames);
         }
         return;
     }
@@ -634,6 +721,10 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
 
     // Zero channels with no physical speakers (fallback channel-based path)
     ZeroUnusedChannels(outputs, sampleFrames, SpeakerLayoutFromParam());
+
+    // Master gain on the channel-based output (the spatial paths apply it via
+    // the writer instead, and have already returned by this point).
+    ApplyMasterGainToOutputs(outputs, sampleFrames);
 }
 
 InputLayout MagicSpatialVst::DetectLayoutFromInputs(float** inputs, VstInt32 sampleFrames) {
@@ -663,6 +754,17 @@ InputLayout MagicSpatialVst::DetectLayoutFromInputs(float** inputs, VstInt32 sam
 
 void MagicSpatialVst::UpdateEngine() {
     m_engineInitialized = false;
+}
+
+void MagicSpatialVst::EnsureSpatialWriterStarted() {
+    // compare_exchange ensures exactly one spawn even if effMainsChanged and
+    // ProcessReplacing race on the first block. Initialize() itself is also
+    // idempotent, but the atomic keeps us from ever calling it twice.
+    bool expected = false;
+    if (m_spatialInitAttempted.compare_exchange_strong(expected, true)) {
+        m_spatialWriter.Initialize();
+        LogMsg("Spatial writer started\n");
+    }
 }
 
 void MagicSpatialVst::EditorRedraw() {

@@ -69,6 +69,10 @@ public:
     // Update the 3D position of an object. Takes effect on the next render cycle.
     void SetObjectPosition(ObjectSlot slot, float x, float y, float z);
 
+    // Master output gain applied to every object's audio as it is submitted.
+    // Linear multiplier (1.0 = unity). Lock-free; safe to call per audio block.
+    void SetMasterGain(float linear) { m_masterGain.store(linear, std::memory_order_relaxed); }
+
     // Reset every object's position to its kDefaultPositions reference.
     // Cheap (12 scalar writes); call at the top of any path that wants a
     // clean slate after another path may have moved objects dynamically.
@@ -80,7 +84,7 @@ private:
     void BackgroundThreadFunc();
     bool ActivateSpatialAudio();
     void TeardownStream();
-    bool RenderLoop();  // returns true if the device was invalidated (caller re-activates)
+    void RenderLoop();
 
     // Spatial audio COM objects
     ComPtr<ISpatialAudioClient> m_spatialClient;
@@ -102,6 +106,7 @@ private:
     std::atomic<bool> m_shutdownRequested{false};
     std::atomic<bool> m_active{false};
     std::atomic<bool> m_failed{false};
+    std::atomic<float> m_masterGain{1.0f};
 
     // Audio exchange buffers (per object)
     // Audio thread writes, render thread reads. Protected by a simple spin mutex.
