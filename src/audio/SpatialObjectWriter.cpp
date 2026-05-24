@@ -184,19 +184,9 @@ void SpatialObjectWriter::Shutdown() {
         m_thread.join();
     }
 
-    // Release in order: objects → stream → client
-    for (auto& obj : m_objects) {
-        obj.object.Reset();
-        obj.active = false;
-    }
-
-    if (m_renderStream) {
-        m_renderStream->Stop();
-        m_renderStream->Reset();
-        m_renderStream.Reset();
-    }
-
-    m_spatialClient.Reset();
+    // The thread tears the stream down on exit; this is a belt-and-braces
+    // release for the case where the thread never started.
+    TeardownStream();
     m_active = false;
 
     // Brief pause to let the audio subsystem fully release the stream
@@ -253,19 +243,52 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
 
     Log("[SpatialObjectWriter] Background thread started, activating spatial audio...\n");
 
-    if (!ActivateSpatialAudio()) {
-        Log("[SpatialObjectWriter] Spatial audio activation FAILED\n");
-        m_failed = true;
-        CoUninitialize();
-        return;
+    // Outer (re)activation loop. The default endpoint can be torn down and
+    // rebuilt beneath us — monitor standby/wake, exclusive-mode handoff, GPU
+    // re-enumeration. Rather than expiring on the first invalidation (which
+    // left the writer permanently inert until a plugin reload), we release the
+    // stale stream and retry until the device returns or shutdown is asked.
+    // While inactive, IsActive() reports false so the plugin falls back to its
+    // channel-based path with no break in playback.
+    while (!m_shutdownRequested) {
+        if (!ActivateSpatialAudio()) {
+            TeardownStream();
+            m_active = false;
+            if (m_shutdownRequested) break;
+            Log("[SpatialObjectWriter] Activation failed; retrying shortly.\n");
+            for (int i = 0; i < 25 && !m_shutdownRequested; ++i) Sleep(200); // ~5s
+            continue;
+        }
+
+        Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
+        m_active = true;
+
+        bool invalidated = RenderLoop();
+
+        m_active = false;
+        TeardownStream();
+
+        if (!invalidated) break;  // clean shutdown — leave the thread for good
+        Log("[SpatialObjectWriter] Device invalidated; re-activating when it returns.\n");
     }
 
-    Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
-    m_active = true;
-
-    RenderLoop();
-
     CoUninitialize();
+}
+
+void SpatialObjectWriter::TeardownStream() {
+    // Release the COM graph in dependency order. Safe to call repeatedly and
+    // on a partially-built stream (every member is null-checked by Reset()).
+    // Does NOT touch the thread or m_shutdownRequested — Shutdown() owns those.
+    for (auto& obj : m_objects) {
+        obj.object.Reset();
+        obj.active = false;
+    }
+    if (m_renderStream) {
+        m_renderStream->Stop();
+        m_renderStream->Reset();
+        m_renderStream.Reset();
+    }
+    m_spatialClient.Reset();
 }
 
 bool SpatialObjectWriter::ActivateSpatialAudio() {
@@ -341,6 +364,7 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
 
     // Retry stream activation — previous instance may not have fully released yet
     for (int attempt = 0; attempt < 100; ++attempt) {
+        if (m_shutdownRequested) return false;
         hr = m_spatialClient->ActivateSpatialAudioStream(
             &activateParams, __uuidof(ISpatialAudioObjectRenderStream),
             reinterpret_cast<void**>(m_renderStream.GetAddressOf()));
@@ -389,9 +413,7 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
     return true;
 }
 
-void SpatialObjectWriter::RenderLoop() {
-    std::vector<float> silenceBuffer(m_maxFrameCount, 0.0f);
-
+bool SpatialObjectWriter::RenderLoop() {
     while (!m_shutdownRequested) {
         DWORD waitResult = WaitForSingleObject(m_renderEvent, 500);
         if (m_shutdownRequested) break;
@@ -403,7 +425,7 @@ void SpatialObjectWriter::RenderLoop() {
         if (FAILED(hr)) {
             if (hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED) {
                 Log("[SpatialObjectWriter] Resources invalidated\n");
-                break;
+                return true;  // device gone — let the thread re-activate
             }
             continue;
         }
@@ -421,9 +443,18 @@ void SpatialObjectWriter::RenderLoop() {
             BYTE* buffer = nullptr;
             UINT32 bufferLength = 0;
             hr = m_objects[i].object->GetBuffer(&buffer, &bufferLength);
-            if (FAILED(hr) || !buffer) continue;
+            if (FAILED(hr) || !buffer || bufferLength == 0) continue;
 
-            UINT32 bytesToWrite = frameCount * sizeof(float);
+            // bufferLength is the AUTHORITATIVE byte count the spatial engine
+            // handed back for this object this cycle. We must never write past
+            // it: while the endpoint is mid-transition (monitor waking,
+            // exclusive-mode handoff, GPU re-enumeration) the frameCount from
+            // BeginUpdating and the per-object buffer can momentarily disagree.
+            // An over-write here corrupts audiodg.exe's heap — which crashes
+            // the entire Windows audio service. Clamp to whichever is smaller.
+            const UINT32 framesAvail  = bufferLength / static_cast<UINT32>(sizeof(float));
+            const UINT32 framesToFill = (frameCount < framesAvail) ? frameCount : framesAvail;
+            if (framesToFill == 0) continue;
 
             // Check if audio thread has submitted data for this object
             bool hasData = false;
@@ -431,12 +462,13 @@ void SpatialObjectWriter::RenderLoop() {
                 std::lock_guard<std::mutex> lock(m_bufferMutex);
                 auto& objBuf = m_buffers[i];
                 if (objBuf.hasNewData.load(std::memory_order_acquire)) {
-                    UINT32 copyFrames = (frameCount < objBuf.validFrames) ? frameCount : objBuf.validFrames;
+                    UINT32 copyFrames = (framesToFill < objBuf.validFrames)
+                                      ? framesToFill : objBuf.validFrames;
                     std::memcpy(buffer, objBuf.data.data(), copyFrames * sizeof(float));
                     // Zero-fill remainder if our buffer is shorter
-                    if (copyFrames < frameCount) {
+                    if (copyFrames < framesToFill) {
                         std::memset(buffer + copyFrames * sizeof(float), 0,
-                            (frameCount - copyFrames) * sizeof(float));
+                            (framesToFill - copyFrames) * sizeof(float));
                     }
                     objBuf.hasNewData.store(false, std::memory_order_release);
                     hasData = true;
@@ -444,17 +476,22 @@ void SpatialObjectWriter::RenderLoop() {
             }
 
             if (!hasData) {
-                // No new data — write silence
-                std::memset(buffer, 0, bytesToWrite);
+                // No new data — write silence (clamped to the engine's buffer)
+                std::memset(buffer, 0, framesToFill * sizeof(float));
             }
         }
 
         hr = m_renderStream->EndUpdatingAudioObjects();
         if (FAILED(hr)) {
+            if (hr == SPTLAUDCLNT_E_RESOURCES_INVALIDATED) {
+                Log("[SpatialObjectWriter] Resources invalidated on EndUpdating\n");
+                return true;
+            }
             Log("[SpatialObjectWriter] EndUpdatingAudioObjects failed: 0x%08lX\n",
                 static_cast<unsigned long>(hr));
         }
     }
+    return false;  // shutdown requested
 }
 
 } // namespace MagicSpatial

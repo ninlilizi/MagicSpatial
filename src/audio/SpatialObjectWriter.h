@@ -79,7 +79,8 @@ public:
 private:
     void BackgroundThreadFunc();
     bool ActivateSpatialAudio();
-    void RenderLoop();
+    void TeardownStream();
+    bool RenderLoop();  // returns true if the device was invalidated (caller re-activates)
 
     // Spatial audio COM objects
     ComPtr<ISpatialAudioClient> m_spatialClient;
