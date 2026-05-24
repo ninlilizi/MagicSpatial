@@ -176,13 +176,16 @@ void SpatialObjectWriter::ResetObjectPositionsToReference() {
 }
 
 void SpatialObjectWriter::Shutdown() {
+    // No background thread means nothing was ever started (a redundant plugin
+    // instance that never processed audio) or we've already shut down. Return
+    // quietly — no log spam, and no needless 100 ms settle-delay for a no-op.
+    if (!m_thread.joinable()) return;
+
     Log("[SpatialObjectWriter] Shutdown requested\n");
     m_shutdownRequested = true;
     if (m_renderEvent) SetEvent(m_renderEvent);
 
-    if (m_thread.joinable()) {
-        m_thread.join();
-    }
+    m_thread.join();
 
     // The thread tears the stream down on exit; this is a belt-and-braces
     // release for the case where the thread never started.
