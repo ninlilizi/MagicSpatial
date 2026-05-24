@@ -883,12 +883,15 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     const float* R = m_sDelayedR.data();
     const float* C = m_sCenter.data();
 
-    // --- Residuals = delayed L/R minus spectral centre ---
-    // Every surround/height/front-L-R feed draws from these so vocals never
-    // leak into anything but OBJ_VOCAL (and a little into the sub below).
+    // --- Residuals = delayed L/R, FULL (centre NOT subtracted) ---
+    // The centred midrange stays on the full-range front pair (which reach
+    // 60 Hz here) as a natural phantom, rather than being extracted off to the
+    // thinner centre speaker — so the fronts lose no energy. The surround/height
+    // feeds below are L-R differences, where centred content cancels regardless,
+    // so they are unaffected by keeping the centre in the fronts.
     for (uint32_t i = 0; i < frames; ++i) {
-        m_sResidualL[i] = L[i] - C[i];
-        m_sResidualR[i] = R[i] - C[i];
+        m_sResidualL[i] = L[i];
+        m_sResidualR[i] = R[i];
     }
     const float* rL = m_sResidualL.data();
     const float* rR = m_sResidualR.data();
@@ -949,11 +952,19 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // All four bands precomputed so each spatial object can carry the full
     // bandwidth (and Dolby's bass management can then route low frequencies
     // to LFE / capable speakers per the user's physical layout).
+    // Per-band energy balance. Every surround/height object is built from these
+    // side bands, and summing their gains across all objects gives an uneven
+    // per-band total that peaks hard in the 2-8 kHz presence band (~15.5) versus
+    // the others (~10.5-12.3) — a built-in presence/brightness boost that reads
+    // as tinny/scratchy. These factors flatten every band's aggregate spatial
+    // gain to ~11.5, so the added wash is tonally neutral and the source's own
+    // balance is preserved. (Derived for the 5.1.2 reference layout.)
+    constexpr float kBandBalance[4] = {1.10f, 0.94f, 0.74f, 1.00f};
     for (uint32_t i = 0; i < frames; ++i) {
-        m_sSide0[i] = (bL0[i] - bR0[i]) * 0.5f;
-        m_sSide1[i] = (bL1[i] - bR1[i]) * 0.5f;
-        m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f;
-        m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f;
+        m_sSide0[i] = (bL0[i] - bR0[i]) * 0.5f * kBandBalance[0];
+        m_sSide1[i] = (bL1[i] - bR1[i]) * 0.5f * kBandBalance[1];
+        m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f * kBandBalance[2];
+        m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f * kBandBalance[3];
     }
 
     // --- Feature 3: Per-band ambience factors from spectral variance ---
@@ -1090,10 +1101,28 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     m_spatialLfeLowpass.Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
-    // --- OBJ_VOCAL: per-bin spectral centre, directly ---
-    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, C, frames);
+    // --- OBJ_VOCAL: discrete centre mixed IN ON TOP of the phantom ---
+    // The fronts already carry the full centred content as a phantom (residuals
+    // keep the whole L/R), and we ALSO send the extracted centre to the centre
+    // speaker. In a distance-calibrated setup the centre arrives time-aligned
+    // with the phantom, so it reinforces coherently — solidifying the image and
+    // restoring the presence a bare phantom loses — rather than draining the
+    // fronts. kCenterSend sets how much discrete centre to add.
+    constexpr float kCenterSend = 0.6f;
+    for (uint32_t i = 0; i < frames; ++i) m_sScratch[i] = C[i] * kCenterSend;
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_VOCAL, m_sScratch.data(), frames);
 
-    // --- OBJ_LEFT / OBJ_RIGHT: residuals (delayed L/R minus spectral centre) ---
+    // --- OBJ_LEFT / OBJ_RIGHT: full delayed L/R, level-restored ---
+    // The direct front content carries the midrange core but inherits the
+    // -3.7 dB global trim, leaving it recessed behind the amplified surround
+    // wash. kFrontGain restores the fronts toward unity so the mids sit forward
+    // again. Applied in place AFTER the band split, so the surround/height
+    // feeds (already derived) keep their balance — only the fronts move.
+    constexpr float kFrontGain = 1.54f;  // ~unity: undoes the 0.65 global trim on the fronts
+    for (uint32_t i = 0; i < frames; ++i) {
+        m_sResidualL[i] *= kFrontGain;
+        m_sResidualR[i] *= kFrontGain;
+    }
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
 
