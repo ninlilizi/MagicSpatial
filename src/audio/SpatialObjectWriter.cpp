@@ -21,6 +21,12 @@ namespace {
     // ping-pong us in and out (the oscillation hazard of an eager reclaim).
     constexpr ULONGLONG kContentionDebounceMs = 750;
     constexpr ULONGLONG kReclaimDebounceMs    = 3000;
+
+    // Render-event wait. The spatial engine normally signals every quantum
+    // (~10 ms). If the source stalls (e.g. a network re-buffer), the event
+    // falls silent — we wake on this timeout instead and push a fresh frame of
+    // silence so the engine has no stale buffer to repeat as a buzz.
+    constexpr DWORD kRenderWaitMs = 64;
 }
 
 // Default 3D positions for each object slot.
@@ -294,10 +300,8 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
     m_active = true;
 
     // Enrol the render thread with the Multimedia Class Scheduler as a Pro Audio
-    // task. Without this the thread runs at default priority and is shoved aside
-    // during the disk/network/decode storm of a video re-buffering — it then
-    // misses the spatial engine's render deadline, the engine repeats its last
-    // object buffer, and the listener hears a buzz until playback resumes.
+    // task and raise it to real-time standing. Sound hygiene for any audio
+    // render thread — it keeps the thread promptly serviced under system load.
     DWORD mmcssTaskIndex = 0;
     HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
     if (mmcssHandle) {
@@ -493,11 +497,27 @@ void SpatialObjectWriter::RenderLoop() {
     Posture posture = Posture::Active;
     ULONGLONG contentionSince = 0;  // tick when a service shortfall began (0 = none)
     ULONGLONG roomSince       = 0;  // tick when the pool became roomy again (0 = none)
+    bool eventStalled = false;      // render event has gone quiet (source buffering?)
 
     while (!m_shutdownRequested) {
-        DWORD waitResult = WaitForSingleObject(m_renderEvent, 500);
+        DWORD waitResult = WaitForSingleObject(m_renderEvent, kRenderWaitMs);
         if (m_shutdownRequested) break;
-        if (waitResult == WAIT_TIMEOUT) continue;
+
+        // A timeout means the engine stopped signalling — the source has most
+        // likely stalled (network re-buffer). We deliberately do NOT skip the
+        // cycle here: running it writes fresh silence into every object so the
+        // engine has nothing stale to repeat. Skipping (the old behaviour) left
+        // the last non-silent buffers in place, which the engine looped as a
+        // sustained buzz until playback resumed.
+        if (waitResult == WAIT_TIMEOUT) {
+            if (!eventStalled) {
+                eventStalled = true;
+                Log("[SpatialObjectWriter] Render event stalled — flushing silence\n");
+            }
+        } else if (eventStalled) {
+            eventStalled = false;
+            Log("[SpatialObjectWriter] Render event resumed\n");
+        }
 
         UINT32 availableDynamic = 0;
         UINT32 frameCount = 0;
