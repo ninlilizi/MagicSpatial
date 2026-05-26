@@ -3,13 +3,25 @@
 
 #include <objbase.h>
 #include <propsys.h>
+#include <avrt.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 
+#pragma comment(lib, "avrt.lib")
+
 namespace MagicSpatial {
 
 #define Log LogMsg
+
+namespace {
+    // Yield/reclaim debouncing. We step aside promptly when a peer spatial
+    // client starves us, but return cautiously — the pool must stay roomy for
+    // a sustained spell before we re-claim, so a fluttering neighbour can't
+    // ping-pong us in and out (the oscillation hazard of an eager reclaim).
+    constexpr ULONGLONG kContentionDebounceMs = 750;
+    constexpr ULONGLONG kReclaimDebounceMs    = 3000;
+}
 
 // Default 3D positions for each object slot.
 // Angles follow ITU-R BS.2051 reference geometry for 7.1.4 rooms.
@@ -94,6 +106,10 @@ private:
 
 class SpatialNotify : public ISpatialAudioObjectRenderStreamNotify {
 public:
+    // Optional sink the writer points at one of its atomics so the latest
+    // available-object count is visible off-thread (diagnostics/calibration).
+    void SetCountSink(std::atomic<UINT32>* sink) { m_countSink = sink; }
+
     STDMETHOD(QueryInterface)(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(ISpatialAudioObjectRenderStreamNotify)) {
@@ -111,11 +127,18 @@ public:
         return c;
     }
     STDMETHOD(OnAvailableDynamicObjectCountChange)(
-        ISpatialAudioObjectRenderStreamBase*, LONGLONG, UINT32) override {
+        ISpatialAudioObjectRenderStreamBase*, LONGLONG, UINT32 available) override {
+        // The OS reapportions the shared dynamic-object pool when another
+        // spatial client appears or departs. Record + log the new count so the
+        // writer (and we, when calibrating) can see the pool breathe.
+        if (m_countSink) m_countSink->store(available, std::memory_order_relaxed);
+        LogMsg("[SpatialObjectWriter] Pool count change: %u dynamic objects available\n",
+            available);
         return S_OK;
     }
 private:
     std::atomic<ULONG> m_ref{1};
+    std::atomic<UINT32>* m_countSink = nullptr;
 };
 
 // --- SpatialObjectWriter implementation ---
@@ -270,7 +293,24 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
     Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
     m_active = true;
 
+    // Enrol the render thread with the Multimedia Class Scheduler as a Pro Audio
+    // task. Without this the thread runs at default priority and is shoved aside
+    // during the disk/network/decode storm of a video re-buffering — it then
+    // misses the spatial engine's render deadline, the engine repeats its last
+    // object buffer, and the listener hears a buzz until playback resumes.
+    DWORD mmcssTaskIndex = 0;
+    HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    if (mmcssHandle) {
+        AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_CRITICAL);
+        Log("[SpatialObjectWriter] Render thread registered with MMCSS (Pro Audio)\n");
+    } else {
+        Log("[SpatialObjectWriter] WARNING: AvSetMmThreadCharacteristics failed: 0x%08lX\n",
+            static_cast<unsigned long>(GetLastError()));
+    }
+
     RenderLoop();
+
+    if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
 
     m_active = false;
     TeardownStream();
@@ -348,6 +388,7 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
 
     // Create render stream with dynamic objects
     auto* notify = new SpatialNotify();
+    notify->SetCountSink(&m_notifiedAvailable);
 
     SpatialAudioObjectRenderStreamActivationParams streamParams{};
     streamParams.ObjectFormat = m_objectFormat;
@@ -391,18 +432,11 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
 
     Log("[SpatialObjectWriter] Max frames per cycle: %u\n", m_maxFrameCount);
 
-    // Activate dynamic objects
-    for (int i = 0; i < OBJ_COUNT && i < static_cast<int>(maxDynamic); ++i) {
-        hr = m_renderStream->ActivateSpatialAudioObject(
-            AudioObjectType_Dynamic, &m_objects[i].object);
-        if (SUCCEEDED(hr)) {
-            m_objects[i].active = true;
-            Log("[SpatialObjectWriter] Object %d activated\n", i);
-        } else {
-            Log("[SpatialObjectWriter] Object %d failed: 0x%08lX\n",
-                i, static_cast<unsigned long>(hr));
-        }
-    }
+    // Activate dynamic objects and record how many we actually hold — this is
+    // the baseline the yield/reclaim machine measures contention against.
+    m_objectTarget = ActivateObjects();
+    Log("[SpatialObjectWriter] Activated %u/%d dynamic objects\n",
+        m_objectTarget, OBJ_COUNT);
 
     // Start the stream
     hr = m_renderStream->Start();
@@ -415,7 +449,51 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
     return true;
 }
 
+UINT32 SpatialObjectWriter::ActivateObjects() {
+    // (Re)activate dynamic objects on the already-live render stream. Used both
+    // at startup and when re-claiming after a yield. Activating objects on an
+    // existing stream is ordinary lifecycle — unlike re-activating the *stream*,
+    // which is the manoeuvre that destabilised the two-instance contention.
+    UINT32 activated = 0;
+    for (int i = 0; i < OBJ_COUNT; ++i) {
+        if (m_objects[i].active && m_objects[i].object) {
+            ++activated;
+            continue;
+        }
+        HRESULT hr = m_renderStream->ActivateSpatialAudioObject(
+            AudioObjectType_Dynamic, m_objects[i].object.GetAddressOf());
+        if (SUCCEEDED(hr) && m_objects[i].object) {
+            m_objects[i].active = true;
+            ++activated;
+        } else {
+            // Pool exhausted — a peer holds the rest. Stop and report what we have.
+            m_objects[i].active = false;
+            break;
+        }
+    }
+    return activated;
+}
+
+void SpatialObjectWriter::ReleaseObjects() {
+    // Hand our dynamic objects back to the shared pool, leaving the render
+    // stream itself alive so a re-claim is cheap. The newcomer spatial client
+    // can then draw the objects we relinquished.
+    for (auto& obj : m_objects) {
+        obj.object.Reset();
+        obj.active = false;
+    }
+}
+
 void SpatialObjectWriter::RenderLoop() {
+    // Two postures. ACTIVE: we hold our objects and write audio. YIELDED: a peer
+    // spatial client crowded the pool, so we let our objects go (m_active=false,
+    // which steers the VST to plain stereo/channel output) and idle on the live
+    // stream, watching for room to return.
+    enum class Posture { Active, Yielded };
+    Posture posture = Posture::Active;
+    ULONGLONG contentionSince = 0;  // tick when a service shortfall began (0 = none)
+    ULONGLONG roomSince       = 0;  // tick when the pool became roomy again (0 = none)
+
     while (!m_shutdownRequested) {
         DWORD waitResult = WaitForSingleObject(m_renderEvent, 500);
         if (m_shutdownRequested) break;
@@ -432,54 +510,102 @@ void SpatialObjectWriter::RenderLoop() {
             continue;
         }
 
-        // Write audio to each active object
-        for (int i = 0; i < OBJ_COUNT; ++i) {
-            if (!m_objects[i].active || !m_objects[i].object) continue;
+        if (posture == Posture::Active) {
+            // Write audio to each active object, counting how many the engine
+            // actually serves a buffer this pass.
+            UINT32 served = 0;
+            for (int i = 0; i < OBJ_COUNT; ++i) {
+                if (!m_objects[i].active || !m_objects[i].object) continue;
 
-            // Set position
-            auto& pos = m_objects[i].position;
-            m_objects[i].object->SetPosition(pos.x, pos.y, pos.z);
-            m_objects[i].object->SetVolume(1.0f);
+                auto& pos = m_objects[i].position;
+                m_objects[i].object->SetPosition(pos.x, pos.y, pos.z);
+                m_objects[i].object->SetVolume(1.0f);
 
-            // Get buffer and fill it
-            BYTE* buffer = nullptr;
-            UINT32 bufferLength = 0;
-            hr = m_objects[i].object->GetBuffer(&buffer, &bufferLength);
-            if (FAILED(hr) || !buffer || bufferLength == 0) continue;
+                BYTE* buffer = nullptr;
+                UINT32 bufferLength = 0;
+                hr = m_objects[i].object->GetBuffer(&buffer, &bufferLength);
+                if (FAILED(hr) || !buffer || bufferLength == 0) continue;
+                ++served;
 
-            // bufferLength is the AUTHORITATIVE byte count the spatial engine
-            // handed back for this object this cycle. We must never write past
-            // it: while the endpoint is mid-transition (monitor waking,
-            // exclusive-mode handoff, GPU re-enumeration) the frameCount from
-            // BeginUpdating and the per-object buffer can momentarily disagree.
-            // An over-write here corrupts audiodg.exe's heap — which crashes
-            // the entire Windows audio service. Clamp to whichever is smaller.
-            const UINT32 framesAvail  = bufferLength / static_cast<UINT32>(sizeof(float));
-            const UINT32 framesToFill = (frameCount < framesAvail) ? frameCount : framesAvail;
-            if (framesToFill == 0) continue;
+                // bufferLength is the AUTHORITATIVE byte count the spatial engine
+                // handed back for this object this cycle. We must never write past
+                // it: while the endpoint is mid-transition (monitor waking,
+                // exclusive-mode handoff, GPU re-enumeration) the frameCount from
+                // BeginUpdating and the per-object buffer can momentarily disagree.
+                // An over-write here corrupts audiodg.exe's heap — which crashes
+                // the entire Windows audio service. Clamp to whichever is smaller.
+                const UINT32 framesAvail  = bufferLength / static_cast<UINT32>(sizeof(float));
+                const UINT32 framesToFill = (frameCount < framesAvail) ? frameCount : framesAvail;
+                if (framesToFill == 0) continue;
 
-            // Check if audio thread has submitted data for this object
-            bool hasData = false;
-            {
-                std::lock_guard<std::mutex> lock(m_bufferMutex);
-                auto& objBuf = m_buffers[i];
-                if (objBuf.hasNewData.load(std::memory_order_acquire)) {
-                    UINT32 copyFrames = (framesToFill < objBuf.validFrames)
-                                      ? framesToFill : objBuf.validFrames;
-                    std::memcpy(buffer, objBuf.data.data(), copyFrames * sizeof(float));
-                    // Zero-fill remainder if our buffer is shorter
-                    if (copyFrames < framesToFill) {
-                        std::memset(buffer + copyFrames * sizeof(float), 0,
-                            (framesToFill - copyFrames) * sizeof(float));
+                bool hasData = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_bufferMutex);
+                    auto& objBuf = m_buffers[i];
+                    if (objBuf.hasNewData.load(std::memory_order_acquire)) {
+                        UINT32 copyFrames = (framesToFill < objBuf.validFrames)
+                                          ? framesToFill : objBuf.validFrames;
+                        std::memcpy(buffer, objBuf.data.data(), copyFrames * sizeof(float));
+                        if (copyFrames < framesToFill) {
+                            std::memset(buffer + copyFrames * sizeof(float), 0,
+                                (framesToFill - copyFrames) * sizeof(float));
+                        }
+                        objBuf.hasNewData.store(false, std::memory_order_release);
+                        hasData = true;
                     }
-                    objBuf.hasNewData.store(false, std::memory_order_release);
-                    hasData = true;
+                }
+
+                if (!hasData) {
+                    std::memset(buffer, 0, framesToFill * sizeof(float));
                 }
             }
 
-            if (!hasData) {
-                // No new data — write silence (clamped to the engine's buffer)
-                std::memset(buffer, 0, framesToFill * sizeof(float));
+            // Contention: if the engine no longer fields our full baseline of
+            // objects, a peer spatial client is drawing from the shared pool.
+            // Debounce so a momentary endpoint transition isn't mistaken for one.
+            if (m_objectTarget > 0 && served < m_objectTarget) {
+                const ULONGLONG now = GetTickCount64();
+                if (contentionSince == 0) {
+                    contentionSince = now;
+                } else if (now - contentionSince >= kContentionDebounceMs) {
+                    Log("[SpatialObjectWriter] Pool contended (served %u/%u, avail %u, "
+                        "notified %u) — yielding objects to peer\n",
+                        served, m_objectTarget, availableDynamic,
+                        m_notifiedAvailable.load(std::memory_order_relaxed));
+                    m_renderStream->EndUpdatingAudioObjects();
+                    ReleaseObjects();
+                    m_active = false;  // VST falls back to stereo/channel output
+                    posture = Posture::Yielded;
+                    contentionSince = 0;
+                    roomSince = 0;
+                    continue;
+                }
+            } else {
+                contentionSince = 0;
+            }
+        } else {
+            // YIELDED: holding no objects. Idle on the stream and watch the free
+            // pool. When it can fit our whole baseline again — sustained past the
+            // reclaim debounce — re-claim our objects and resume.
+            if (m_objectTarget > 0 && availableDynamic >= m_objectTarget) {
+                const ULONGLONG now = GetTickCount64();
+                if (roomSince == 0) {
+                    roomSince = now;
+                } else if (now - roomSince >= kReclaimDebounceMs) {
+                    UINT32 got = ActivateObjects();
+                    if (got >= m_objectTarget) {
+                        Log("[SpatialObjectWriter] Pool clear (avail %u) — reclaimed "
+                            "%u/%u objects, resuming\n", availableDynamic, got, m_objectTarget);
+                        m_active = true;
+                        posture = Posture::Active;
+                    } else {
+                        // A peer beat us to the slots — let go and keep waiting.
+                        ReleaseObjects();
+                    }
+                    roomSince = 0;
+                }
+            } else {
+                roomSince = 0;
             }
         }
 

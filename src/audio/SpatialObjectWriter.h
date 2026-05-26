@@ -83,6 +83,8 @@ public:
 private:
     void BackgroundThreadFunc();
     bool ActivateSpatialAudio();
+    UINT32 ActivateObjects();   // (re)activate dynamic objects on the live stream; returns count
+    void ReleaseObjects();      // hand our dynamic objects back to the shared pool
     void TeardownStream();
     void RenderLoop();
 
@@ -100,6 +102,17 @@ private:
     HANDLE m_renderEvent = nullptr;
     UINT32 m_maxFrameCount = 0;
     WAVEFORMATEX* m_objectFormat = nullptr;
+
+    // Number of dynamic objects we successfully held at startup — our baseline.
+    // The yield/reclaim machine compares against this (not OBJ_COUNT) so a rig
+    // whose renderer offers fewer than OBJ_COUNT objects isn't read as permanent
+    // contention. Render-thread only; no synchronisation needed.
+    UINT32 m_objectTarget = 0;
+
+    // Latest available-object count reported by the OS notify callback. Stored
+    // for diagnostics/calibration — the state machine keys off observed buffer
+    // service and BeginUpdating's per-pass count rather than this alone.
+    std::atomic<UINT32> m_notifiedAvailable{0};
 
     // Background thread
     std::thread m_thread;
