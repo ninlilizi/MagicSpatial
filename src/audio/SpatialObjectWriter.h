@@ -17,6 +17,9 @@ using Microsoft::WRL::ComPtr;
 
 namespace MagicSpatial {
 
+// Watches the audio endpoints on behalf of the writer; defined in the .cpp.
+class EndpointNotificationClient;
+
 // Writes audio as positioned 3D objects via ISpatialAudioClient.
 // Designed to run from within an E-APO VST DLL — activates spatial audio
 // on the default render endpoint from a background MTA thread.
@@ -80,13 +83,32 @@ public:
 
     void Shutdown();
 
+    // Sleep/resume lifecycle hooks. Safe to call from any thread (the host's
+    // control thread or an OS power-notification callback). NotifySuspend steers
+    // the render thread to relinquish the spatial stream BEFORE the system sleeps
+    // so audiodg can tear its graph down without waiting on us; NotifyResume
+    // re-arms it to rebuild on a healthy endpoint. The writer also registers for
+    // these notifications itself, so these are belt-and-braces with the OS watch.
+    void NotifySuspend();
+    void NotifyResume();
+
 private:
+    friend class EndpointNotificationClient;
+
     void BackgroundThreadFunc();
     bool ActivateSpatialAudio();
     UINT32 ActivateObjects();   // (re)activate dynamic objects on the live stream; returns count
     void ReleaseObjects();      // hand our dynamic objects back to the shared pool
     void TeardownStream();
     void RenderLoop();
+
+    // Endpoint/power watch lifecycle (render-thread owned).
+    void RegisterEndpointWatch();
+    void UnregisterEndpointWatch();
+    void RegisterPowerWatch();
+    void UnregisterPowerWatch();
+    void OnEndpointChanged();   // called off-thread by the notification client
+    static unsigned long __stdcall PowerCallbackThunk(void* ctx, unsigned long type, void* setting);
 
     // Spatial audio COM objects
     ComPtr<ISpatialAudioClient> m_spatialClient;
@@ -130,6 +152,21 @@ private:
     };
     ObjectBuffer m_buffers[OBJ_COUNT];
     std::mutex m_bufferMutex;
+
+    // --- Sleep/resume + endpoint-loss resilience ---
+    // m_suspendRequested: the system is sleeping (or the host stopped us) — hold
+    //   no stream until it clears. m_deviceChanged: the default render endpoint
+    //   moved or fell out from under us — rebuild against the new one. Both are
+    //   set off the render thread (host hook / OS callback) and consumed by the
+    //   supervisor + render loops, which signal m_renderEvent to break a wait.
+    std::atomic<bool> m_suspendRequested{false};
+    std::atomic<bool> m_deviceChanged{false};
+
+    // Held for the writer's lifetime so endpoint notifications keep arriving; the
+    // activation path also borrows it instead of spinning up a second enumerator.
+    ComPtr<IMMDeviceEnumerator> m_enumerator;
+    EndpointNotificationClient* m_notificationClient = nullptr;
+    void* m_powerNotify = nullptr;  // HPOWERNOTIFY from PowerRegisterSuspendResumeNotification
 
     // Default object positions
     static const ObjectPosition kDefaultPositions[OBJ_COUNT];

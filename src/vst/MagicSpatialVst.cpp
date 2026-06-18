@@ -206,10 +206,18 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         if (value != 0) {
             // Resume = this instance is about to process audio, so it is the
             // real audio-engine instance. Safe place (control thread, not the
-            // audio thread) to spawn the spatial writer.
+            // audio thread) to spawn the spatial writer. NotifyResume re-arms the
+            // writer if a prior suspend parked it; it is a no-op on a fresh start.
             EnsureSpatialWriterStarted();
+            m_spatialWriter.NotifyResume();
         } else {
             m_engine.Reset();
+            // Suspend = the host is stopping the engine (system sleep, format
+            // change, config reload). Relinquish the spatial stream now, while
+            // audiodg is still healthy, rather than clutching it across the
+            // transition. The writer also catches the OS suspend signal itself,
+            // but this fires first when the host forwards it.
+            m_spatialWriter.NotifySuspend();
         }
         return 0;
 

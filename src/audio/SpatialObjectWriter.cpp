@@ -4,11 +4,13 @@
 #include <objbase.h>
 #include <propsys.h>
 #include <avrt.h>
+#include <powrprof.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 
 #pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "PowrProf.lib")
 
 namespace MagicSpatial {
 
@@ -27,6 +29,14 @@ namespace {
     // falls silent — we wake on this timeout instead and push a fresh frame of
     // silence so the engine has no stale buffer to repeat as a buzz.
     constexpr DWORD kRenderWaitMs = 64;
+
+    // Supervisor cadences for the dormant (no-stream) states. While suspended we
+    // simply re-check the flag; after a failed (re)activation we wait this long
+    // before another paced attempt. A notification (resume/endpoint change) wakes
+    // us immediately via m_renderEvent — the timeouts are only a liveness floor,
+    // kept generous so we never spin-fight a sibling instance for the one stream.
+    constexpr DWORD kSupervisorIdleMs    = 200;
+    constexpr DWORD kReactivateBackoffMs = 2000;
 }
 
 // Default 3D positions for each object slot.
@@ -147,6 +157,53 @@ private:
     std::atomic<UINT32>* m_countSink = nullptr;
 };
 
+// --- IMMNotificationClient: watches the render endpoint for sleep/unplug ---
+
+class EndpointNotificationClient : public IMMNotificationClient {
+public:
+    explicit EndpointNotificationClient(SpatialObjectWriter* owner) : m_owner(owner) {}
+
+    STDMETHOD(QueryInterface)(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *ppv = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHOD_(ULONG, AddRef)() override { return m_ref.fetch_add(1) + 1; }
+    STDMETHOD_(ULONG, Release)() override {
+        ULONG c = m_ref.fetch_sub(1) - 1;
+        if (c == 0) delete this;
+        return c;
+    }
+
+    // The default render endpoint moving is our signal that HDMI returned after
+    // resume, was unplugged, or the user switched outputs — rebuild against it.
+    STDMETHOD(OnDefaultDeviceChanged)(EDataFlow flow, ERole role, LPCWSTR) override {
+        if (flow == eRender && (role == eConsole || role == eMultimedia) && m_owner)
+            m_owner->OnEndpointChanged();
+        return S_OK;
+    }
+    // An endpoint leaving the ACTIVE state (HDMI sink powering down, GPU
+    // re-enumeration on monitor wake) is our cue to relinquish before audiodg
+    // churns the graph beneath us.
+    STDMETHOD(OnDeviceStateChanged)(LPCWSTR, DWORD newState) override {
+        if (newState != DEVICE_STATE_ACTIVE && m_owner)
+            m_owner->OnEndpointChanged();
+        return S_OK;
+    }
+    STDMETHOD(OnDeviceAdded)(LPCWSTR) override { return S_OK; }
+    STDMETHOD(OnDeviceRemoved)(LPCWSTR) override { return S_OK; }
+    STDMETHOD(OnPropertyValueChanged)(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+
+private:
+    std::atomic<ULONG> m_ref{1};
+    SpatialObjectWriter* m_owner = nullptr;
+};
+
 // --- SpatialObjectWriter implementation ---
 
 SpatialObjectWriter::SpatialObjectWriter() {
@@ -174,6 +231,10 @@ bool SpatialObjectWriter::Initialize() {
     m_shutdownRequested = false;
     m_failed = false;
     m_active = false;
+    // Clear any stale sleep/endpoint state so a re-initialized writer never
+    // begins life parked in the dormant posture.
+    m_suspendRequested = false;
+    m_deviceChanged = false;
 
     // Allocate exchange buffers
     for (auto& buf : m_buffers) {
@@ -279,25 +340,13 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
         return;
     }
 
-    Log("[SpatialObjectWriter] Background thread started, activating spatial audio...\n");
+    Log("[SpatialObjectWriter] Background thread started\n");
 
-    // A SINGLE activation attempt. If it fails — most commonly because another
-    // plugin instance (E-APO loads the plugin once for its editor view and
-    // again in the audio engine) already holds the one spatial render stream —
-    // we give up and let this instance fall back to its channel-based output.
-    // Retrying in a loop here makes the two instances fight over the stream
-    // endlessly, which manifests as unstable or absent spatial audio.
-    if (!ActivateSpatialAudio()) {
-        Log("[SpatialObjectWriter] Spatial audio activation FAILED\n");
-        m_failed = true;
-        m_active = false;
-        TeardownStream();
-        CoUninitialize();
-        return;
-    }
-
-    Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
-    m_active = true;
+    // Begin watching for sleep/resume and endpoint loss BEFORE the first
+    // activation, so a device that appears late (HDMI still enumerating on a
+    // cold start) re-triggers us rather than leaving us silent.
+    RegisterEndpointWatch();
+    RegisterPowerWatch();
 
     // Enrol the render thread with the Multimedia Class Scheduler as a Pro Audio
     // task and raise it to real-time standing. Sound hygiene for any audio
@@ -312,9 +361,56 @@ void SpatialObjectWriter::BackgroundThreadFunc() {
             static_cast<unsigned long>(GetLastError()));
     }
 
-    RenderLoop();
+    // Supervisor loop. The render thread now outlives any single stream: it can
+    // relinquish the spatial stream across a sleep transition (so audiodg can
+    // tear its graph down without waiting on our critical-priority thread — the
+    // root of the audio-service deadlock) and rebuild once a sound endpoint
+    // returns.
+    bool firstAttempt = true;
+    while (!m_shutdownRequested.load(std::memory_order_acquire)) {
+        // Dormant while the system sleeps (or the host has stopped us). We hold
+        // NO spatial stream here, which is the whole point.
+        if (m_suspendRequested.load(std::memory_order_acquire)) {
+            m_active = false;
+            WaitForSingleObject(m_renderEvent, kSupervisorIdleMs);
+            continue;
+        }
+
+        // Clear the change flag BEFORE activating so an endpoint move that lands
+        // mid-activation re-triggers us instead of being lost to the edge.
+        m_deviceChanged.store(false, std::memory_order_release);
+
+        if (ActivateSpatialAudio()) {
+            Log("[SpatialObjectWriter] Spatial audio ACTIVE! Entering render loop.\n");
+            firstAttempt = false;
+            m_failed = false;
+            m_active = true;
+            RenderLoop();   // returns on shutdown / suspend / endpoint change / invalidation
+            m_active = false;
+            TeardownStream();
+            continue;       // re-evaluate: shut down? sleep? rebuild?
+        }
+
+        // Activation failed. On the very first attempt this mirrors the original
+        // behaviour — fall back to channel output (m_active stays false) and flag
+        // failure — most often because a sibling plugin instance holds the one
+        // per-endpoint stream during E-APO's load handoff. We never tight-loop
+        // here; we wait for a fresh resume/endpoint signal (or a paced backoff)
+        // so the two instances can't fight over the stream.
+        m_active = false;
+        TeardownStream();
+        if (firstAttempt) {
+            Log("[SpatialObjectWriter] Spatial audio activation FAILED — channel fallback\n");
+            firstAttempt = false;
+            m_failed = true;
+        }
+        WaitForSingleObject(m_renderEvent, kReactivateBackoffMs);
+    }
 
     if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
+
+    UnregisterPowerWatch();
+    UnregisterEndpointWatch();
 
     m_active = false;
     TeardownStream();
@@ -337,19 +433,113 @@ void SpatialObjectWriter::TeardownStream() {
     m_spatialClient.Reset();
 }
 
-bool SpatialObjectWriter::ActivateSpatialAudio() {
-    // Get default render device
-    ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-        CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+void SpatialObjectWriter::RegisterEndpointWatch() {
+    if (!m_enumerator) {
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+            CLSCTX_ALL, IID_PPV_ARGS(&m_enumerator));
+        if (FAILED(hr) || !m_enumerator) {
+            Log("[SpatialObjectWriter] Endpoint watch: enumerator unavailable: 0x%08lX\n",
+                static_cast<unsigned long>(hr));
+            m_enumerator.Reset();
+            return;
+        }
+    }
+    m_notificationClient = new EndpointNotificationClient(this);
+    HRESULT hr = m_enumerator->RegisterEndpointNotificationCallback(m_notificationClient);
     if (FAILED(hr)) {
-        Log("[SpatialObjectWriter] Failed to create MMDeviceEnumerator: 0x%08lX\n",
+        Log("[SpatialObjectWriter] RegisterEndpointNotificationCallback failed: 0x%08lX\n",
             static_cast<unsigned long>(hr));
-        return false;
+        m_notificationClient->Release();
+        m_notificationClient = nullptr;
+    } else {
+        Log("[SpatialObjectWriter] Endpoint-change watch registered\n");
+    }
+}
+
+void SpatialObjectWriter::UnregisterEndpointWatch() {
+    if (m_enumerator && m_notificationClient) {
+        m_enumerator->UnregisterEndpointNotificationCallback(m_notificationClient);
+    }
+    if (m_notificationClient) {
+        m_notificationClient->Release();
+        m_notificationClient = nullptr;
+    }
+    m_enumerator.Reset();
+}
+
+void SpatialObjectWriter::RegisterPowerWatch() {
+    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS params{};
+    params.Callback = &SpatialObjectWriter::PowerCallbackThunk;
+    params.Context  = this;
+    HPOWERNOTIFY handle = nullptr;
+    DWORD rc = PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK,
+        reinterpret_cast<HANDLE>(&params), &handle);
+    if (rc != ERROR_SUCCESS) {
+        Log("[SpatialObjectWriter] PowerRegisterSuspendResumeNotification failed: %lu\n", rc);
+        m_powerNotify = nullptr;
+    } else {
+        m_powerNotify = handle;
+        Log("[SpatialObjectWriter] Suspend/resume watch registered\n");
+    }
+}
+
+void SpatialObjectWriter::UnregisterPowerWatch() {
+    if (m_powerNotify) {
+        PowerUnregisterSuspendResumeNotification(static_cast<HPOWERNOTIFY>(m_powerNotify));
+        m_powerNotify = nullptr;
+    }
+}
+
+unsigned long __stdcall SpatialObjectWriter::PowerCallbackThunk(
+    void* ctx, unsigned long type, void* /*setting*/) {
+    auto* self = static_cast<SpatialObjectWriter*>(ctx);
+    if (!self) return 0;
+    switch (type) {
+    case PBT_APMSUSPEND:
+        self->NotifySuspend();
+        break;
+    case PBT_APMRESUMESUSPEND:
+    case PBT_APMRESUMEAUTOMATIC:
+        self->NotifyResume();
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+void SpatialObjectWriter::NotifySuspend() {
+    m_suspendRequested.store(true, std::memory_order_release);
+    if (m_renderEvent) SetEvent(m_renderEvent);
+}
+
+void SpatialObjectWriter::NotifyResume() {
+    m_suspendRequested.store(false, std::memory_order_release);
+    m_deviceChanged.store(true, std::memory_order_release); // prompt a fresh activation
+    if (m_renderEvent) SetEvent(m_renderEvent);
+}
+
+void SpatialObjectWriter::OnEndpointChanged() {
+    m_deviceChanged.store(true, std::memory_order_release);
+    if (m_renderEvent) SetEvent(m_renderEvent);
+}
+
+bool SpatialObjectWriter::ActivateSpatialAudio() {
+    // Reuse the writer-lifetime enumerator (also used by the endpoint watch);
+    // create one only if the watch could not.
+    if (!m_enumerator) {
+        HRESULT hrEnum = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+            CLSCTX_ALL, IID_PPV_ARGS(&m_enumerator));
+        if (FAILED(hrEnum) || !m_enumerator) {
+            Log("[SpatialObjectWriter] Failed to create MMDeviceEnumerator: 0x%08lX\n",
+                static_cast<unsigned long>(hrEnum));
+            m_enumerator.Reset();
+            return false;
+        }
     }
 
     ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+    HRESULT hr = m_enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
     if (FAILED(hr)) {
         Log("[SpatialObjectWriter] Failed to get default render device: 0x%08lX\n",
             static_cast<unsigned long>(hr));
@@ -411,7 +601,13 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
 
     // Retry stream activation — previous instance may not have fully released yet
     for (int attempt = 0; attempt < 100; ++attempt) {
-        if (m_shutdownRequested) return false;
+        // Abandon a slow activation the instant we are told to sleep, shut down,
+        // or chase a moved endpoint — never sit in a 20 s retry across a sleep.
+        if (m_shutdownRequested.load(std::memory_order_acquire) ||
+            m_suspendRequested.load(std::memory_order_acquire) ||
+            m_deviceChanged.load(std::memory_order_acquire)) {
+            return false;
+        }
         hr = m_spatialClient->ActivateSpatialAudioStream(
             &activateParams, __uuidof(ISpatialAudioObjectRenderStream),
             reinterpret_cast<void**>(m_renderStream.GetAddressOf()));
@@ -502,6 +698,19 @@ void SpatialObjectWriter::RenderLoop() {
     while (!m_shutdownRequested) {
         DWORD waitResult = WaitForSingleObject(m_renderEvent, kRenderWaitMs);
         if (m_shutdownRequested) break;
+
+        // Withdraw from the audio graph the instant we learn the system is
+        // suspending or the endpoint moved — BEFORE the next call into the
+        // stream. This is the deadlock-prevention crux: a spatial COM call
+        // (BeginUpdating/GetBuffer/EndUpdating) that blocks inside audiodg while
+        // the graph is being torn down would wedge this critical-priority thread
+        // and, with it, the whole Windows audio service. The supervisor loop will
+        // tear the stream down cleanly and either go dormant or rebuild.
+        if (m_suspendRequested.load(std::memory_order_acquire) ||
+            m_deviceChanged.load(std::memory_order_acquire)) {
+            Log("[SpatialObjectWriter] Withdrawing from stream (suspend/endpoint change)\n");
+            break;
+        }
 
         // A timeout means the engine stopped signalling — the source has most
         // likely stalled (network re-buffer). We deliberately do NOT skip the
