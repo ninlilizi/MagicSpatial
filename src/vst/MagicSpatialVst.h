@@ -193,6 +193,25 @@ private:
     static constexpr float kSpatialExtGainMin = 0.45f;
     static constexpr float kSpatialExtGainMax = 0.75f;
 
+    // --- Feature 5: Low-mid envelopment feed ---
+    // Bass and low-mids are mono in nearly every mix, so the L-R side signal
+    // that drives every surround/height object is empty below ~300 Hz and the
+    // wash carries presence only. This feed takes the 100-500 Hz body of the
+    // MID signal, decorrelates each copy with long delays and low-break
+    // allpasses (the stock presets are transparent at these wavelengths), and
+    // adds it IN PHASE to the sides, backs and heights. In-phase copies survive
+    // the renderer's bass management and never null at the seat.
+    BiquadFilter m_lowMidHp[2];   // LR4 highpass at kLowMidEnvLowHz
+    BiquadFilter m_lowMidLp[2];   // LR4 lowpass at kLowMidEnvHighHz
+    Decorrelator m_lowMidDecorr[8]; // [0]SL [1]SR [2]BL [3]BR [4]TFL [5]TFR [6]TBL [7]TBR
+    std::vector<float> m_sLowMid;
+    static constexpr float kLowMidEnvLowHz  = 100.0f;
+    static constexpr float kLowMidEnvHighHz = 500.0f;
+    // Gain relative to the delayed mid, before spatialExtGain. Surround pairs
+    // receive the full amount, heights half.
+    static constexpr float kLowMidEnvGain       = 0.55f;
+    static constexpr float kLowMidEnvHeightGain = 0.5f;
+
     // --- Feature 3: Spectral-variance ambience extraction ---
     int m_ambBinCount[4] = {0, 0, 0, 0};        // precomputed bin counts per band
     float m_smoothAmbFactor[4] = {0.f, 0.f, 0.f, 0.f};

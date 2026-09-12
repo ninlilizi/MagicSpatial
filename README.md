@@ -8,14 +8,14 @@ Stereo input first runs through a streaming STFT that extracts the phantom centr
 
 | Object | Content | Position |
 |---|---|---|
-| Sub-bass | Lowpassed mid | Centre, grounded |
+| Sub-bass | Lowpassed mid | Front centre, bass-managed to the sub |
 | Vocal | Per-bin spectral centre (temporally smoothed) | Front centre (steered) |
 | Left / Right | Delayed L/R with the spectral centre peeled out | Front L/R (steered) |
-| Side L/R | Decorrelated band ambient, transient-ducked | ±90° (or rear, per SurroundPos) |
-| Back L/R | Presence-band ambient | ±135° |
+| Side L/R | Decorrelated band ambient, transient-ducked, plus low-mid body | ±90° (or rear, per SurroundPos) |
+| Back L/R | Presence-band ambient, plus low-mid body | ±135° |
 | Top-front / -back L/R | Side-signal band blends, brightness-steered elevation | Overhead front / rear |
 
-Side and back objects also receive an early-reflection pre-delay and a light feedback-diffusion tail for a sense of depth. 5.1/7.1 input is promoted straight to positioned objects with no remixing; if spatial output is unavailable, a channel-based upmix is used instead.
+Because bass and low-mids are mono in nearly every mix, the side signal carries nothing below ~300 Hz; a separate 100-500 Hz feed from the mid signal is decorrelated with long delays and low-break allpasses and added in phase to the surrounds and heights, so the envelopment has body rather than presence alone. Side and back objects also receive an early-reflection pre-delay and a light feedback-diffusion tail for a sense of depth. 5.1/7.1 input is promoted straight to positioned objects with no remixing; if spatial output is unavailable, a channel-based upmix is used instead.
 
 ## Requirements
 

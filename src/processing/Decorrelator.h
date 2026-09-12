@@ -43,4 +43,9 @@ struct DecorrelatorConfig {
 // Returns 8 preset configurations with distinct allpass/delay parameters.
 const DecorrelatorConfig* GetDecorrelatorPresets();
 
+// First-order allpass coefficient whose 90-degree phase point sits at breakHz.
+// Coefficients near +1 place the break low; the stock presets (|a| <= 0.8)
+// only shift phase above ~2 kHz, so low-frequency decorrelation needs these.
+float AllpassCoeffForBreakHz(float breakHz, float sampleRate);
+
 } // namespace MagicSpatial

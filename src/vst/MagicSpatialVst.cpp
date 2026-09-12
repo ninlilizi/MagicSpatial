@@ -836,6 +836,39 @@ void MagicSpatialVst::InitSpatialDsp() {
     for (int i = 0; i < 4; ++i)
         m_rearDiffuser[i].Initialize(sr);
 
+    // --- Feature 5: Low-mid envelopment feed ---
+    {
+        auto hp = DesignHighpass(kLowMidEnvLowHz, sr);
+        auto lp = DesignLowpass(kLowMidEnvHighHz, sr);
+        for (int i = 0; i < 2; ++i) {
+            m_lowMidHp[i].SetCoeffs(hp);
+            m_lowMidLp[i].SetCoeffs(lp);
+        }
+        m_sLowMid.resize(maxFrames);
+
+        // Delays land in the early-reflection window once the 8 ms rear
+        // pre-delay is added; break frequencies spread across the band so
+        // every copy carries a different phase signature.
+        struct LowMidPreset { float delayMs; float breakHz[3]; };
+        static constexpr LowMidPreset kPresets[8] = {
+            { 9.0f, { 90.0f, 180.0f, 340.0f}},   // SL
+            {13.0f, {110.0f, 230.0f, 400.0f}},   // SR
+            {15.0f, { 80.0f, 200.0f, 360.0f}},   // BL
+            {11.0f, {130.0f, 260.0f, 450.0f}},   // BR
+            {17.0f, {100.0f, 170.0f, 300.0f}},   // TFL
+            { 7.0f, {120.0f, 250.0f, 420.0f}},   // TFR
+            {19.0f, { 85.0f, 210.0f, 380.0f}},   // TBL
+            {21.0f, {140.0f, 190.0f, 330.0f}},   // TBR
+        };
+        for (int i = 0; i < 8; ++i) {
+            float coeffs[3];
+            for (int c = 0; c < 3; ++c)
+                coeffs[c] = AllpassCoeffForBreakHz(kPresets[i].breakHz[c], sr);
+            size_t delay = static_cast<size_t>(kPresets[i].delayMs * sr / 1000.0f + 0.5f);
+            m_lowMidDecorr[i].Initialize(coeffs, 3, delay);
+        }
+    }
+
     // --- Feature 3: Ambience bin counts per band ---
     {
         float binHz = sr / static_cast<float>(SpectralSeparator::kFftSize);
@@ -941,6 +974,12 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
     m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
 
+    // --- Feature 5: 100-500 Hz body of the mid (LR4 bandpass) ---
+    m_lowMidHp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
+    m_lowMidHp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
+    m_lowMidLp[0].Process(m_sLowMid.data(), m_sScratch.data(), frames);
+    m_lowMidLp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
+
     // --- Feature 2: Correlation-adaptive spatial extension gain ---
     // Average correlation across bands (weighted by perceptual importance) to
     // modulate how aggressively spatial content wraps the listener. Reverberant
@@ -996,10 +1035,19 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
     }
 
+    // Adds a decorrelated copy of the low-mid body to dst, in phase, with no
+    // transient duck so the rear pair answers a kick like a real room.
+    auto addLowMidEnv = [&](int decorrIndex, float* dst, float gain) {
+        m_lowMidDecorr[decorrIndex].Process(m_sLowMid.data(), m_sScratch.data(), frames);
+        const float g = gain * spatialExtGain * ambFactor[1];
+        for (uint32_t i = 0; i < frames; ++i) dst[i] += m_sScratch[i] * g;
+    };
+
     // Dynamic L/R position steering: compute energy balance on the delayed mid
-    // range and slide the L/R objects slightly toward the dominant side. Base
-    // angles are the ITU reference ±30° positions; the balance adds at most
-    // ±0.08 of horizontal sway so the pair never collapses.
+    // range and slide the dominant side's object slightly further outward.
+    // Base angles are the ±45° room-corner positions; the sway only ever widens
+    // (at most 0.08), never narrows, so neither object drifts inward toward
+    // the centre speaker's panning zone.
     float energyL = 0.0f, energyR = 0.0f;
     int step = std::max(1, sampleFrames / 64);
     for (VstInt32 i = 0; i < sampleFrames; i += step) {
@@ -1013,10 +1061,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // the front pair across the stage rather than teleporting.
     m_smoothBalance += kBalanceSmoothing * (rawBalance - m_smoothBalance);
 
-    float leftX  = -0.500f + m_smoothBalance * 0.08f;
-    float rightX =  0.500f + m_smoothBalance * 0.08f;
-    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_LEFT,  leftX,  0.0f, -0.866f);
-    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_RIGHT, rightX, 0.0f, -0.866f);
+    float leftX  = -0.707f + std::min(0.0f, m_smoothBalance) * 0.08f;
+    float rightX =  0.707f + std::max(0.0f, m_smoothBalance) * 0.08f;
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_LEFT,  leftX,  0.0f, -0.707f);
+    m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_RIGHT, rightX, 0.0f, -0.707f);
 
     // Vocal head-lock with pitch-tracked elevation.
     //
@@ -1224,6 +1272,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sSurrL[i] *= spatialExtGain;
             m_sSurrR[i] *= spatialExtGain;
         }
+        addLowMidEnv(0, m_sSurrL.data(), kLowMidEnvGain);
+        addLowMidEnv(1, m_sSurrR.data(), kLowMidEnvGain);
         // Feature 1+4: pre-delay + diffusion on sides
         {
             int len = m_rearDelayLength;
@@ -1271,6 +1321,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sSurrL[i] *= spatialExtGain;
             m_sSurrR[i] *= spatialExtGain;
         }
+        addLowMidEnv(2, m_sSurrL.data(), kLowMidEnvGain);
+        addLowMidEnv(3, m_sSurrR.data(), kLowMidEnvGain);
         // Feature 1+4: pre-delay + diffusion on backs
         {
             int len = m_rearDelayLength;
@@ -1335,6 +1387,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sHeightL[i] *= spatialExtGain;
             m_sHeightR[i] *= spatialExtGain;
         }
+        addLowMidEnv(4, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
+        addLowMidEnv(5, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), frames);
 
@@ -1358,6 +1412,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
                 m_sHeightL[i] *= spatialExtGain;
                 m_sHeightR[i] *= spatialExtGain;
             }
+            addLowMidEnv(6, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
+            addLowMidEnv(7, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
             m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), frames);
             m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), frames);
         } else {

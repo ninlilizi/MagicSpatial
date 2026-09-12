@@ -1,4 +1,5 @@
 #include "processing/Decorrelator.h"
+#include <cmath>
 #include <cstring>
 
 namespace MagicSpatial {
@@ -16,6 +17,11 @@ static const DecorrelatorConfig s_presets[8] = {
 
 const DecorrelatorConfig* GetDecorrelatorPresets() {
     return s_presets;
+}
+
+float AllpassCoeffForBreakHz(float breakHz, float sampleRate) {
+    float t = std::tan(3.14159265f * breakHz / sampleRate);
+    return (1.0f - t) / (1.0f + t);
 }
 
 Decorrelator::Decorrelator(std::initializer_list<float> coefficients, size_t delaySamples) {

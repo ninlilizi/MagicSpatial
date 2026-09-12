@@ -42,12 +42,18 @@ namespace {
 // Default 3D positions for each object slot.
 // Angles follow ITU-R BS.2051 reference geometry for 7.1.4 rooms.
 // Coordinate system: +X right, +Y up, -Z forward. All positions lie on the
-// unit sphere (|pos| ~= 1) except SUBBASS which is placed slightly grounded.
+// unit sphere (|pos| ~= 1). SUBBASS shares the centre speaker's position: the
+// renderer has no below-plane speakers, so a grounded position was undefined,
+// whereas the centre is always bass-managed to the subwoofer.
 const SpatialObjectWriter::ObjectPosition SpatialObjectWriter::kDefaultPositions[OBJ_COUNT] = {
-    { 0.000f, -0.300f,  0.000f}, // OBJ_SUBBASS:     centre, grounded
+    { 0.000f,  0.000f, -1.000f}, // OBJ_SUBBASS:     0° azimuth, 0° elevation (bass-managed via centre)
     { 0.000f,  0.000f, -1.000f}, // OBJ_VOCAL:        0° azimuth, 0° elevation  (reference)
-    {-0.500f,  0.000f, -0.866f}, // OBJ_LEFT:       -30° azimuth, 0° elevation
-    { 0.500f,  0.000f, -0.866f}, // OBJ_RIGHT:      +30° azimuth, 0° elevation
+    // Fronts sit at the room corners (45°), not the ITU 30°. Dolby's home
+    // renderer pans an object at 30° between the L/R and centre speakers,
+    // which bleeds the stereo image onto the centre; at 45° it lands on the
+    // corner speaker alone.
+    {-0.707f,  0.000f, -0.707f}, // OBJ_LEFT:       -45° azimuth, 0° elevation
+    { 0.707f,  0.000f, -0.707f}, // OBJ_RIGHT:      +45° azimuth, 0° elevation
     {-1.000f,  0.000f,  0.000f}, // OBJ_SIDE_LEFT:  -90° azimuth, 0° elevation
     { 1.000f,  0.000f,  0.000f}, // OBJ_SIDE_RIGHT: +90° azimuth, 0° elevation
     {-0.707f,  0.000f,  0.707f}, // OBJ_BACK_LEFT: -135° azimuth, 0° elevation
