@@ -36,11 +36,14 @@ enum class SpeakerLayout {
 // Parameters:
 //   0 - Mode:     Auto / Stereo / 5.1 / 7.1 / Passthrough
 //   1 - Speakers:  2.0 / 5.1.2 / 5.1.4 / 7.1.2 / 7.1.4
+//   2 - SurroundPos: Side / Rear
+//   3 - Volume:   -12..+12 dB
+//   4 - LfeCut:   40 / 60 / 80 / 100 / 120 Hz sub-bass crossover
 class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
     static constexpr int kNumOutputs = 12;
-    static constexpr int kNumParams  = 4;
+    static constexpr int kNumParams  = 5;
 
     static constexpr VstInt32 kUniqueID = 'MgSp';
 
@@ -99,6 +102,16 @@ private:
     // bitstream-passthrough audio, which bypasses the Windows mixer entirely.
     float m_paramMasterGain = 0.5f;
 
+    // Sub-bass crossover: the frequency below which the mid signal is handed
+    // to the LFE bed. Set it to the front pair's own low-frequency limit so
+    // the sub takes over exactly where the fronts stop. Combo encoding is
+    // sel * 0.2 over kLfeCutChoices; decoded at the midpoints.
+    static constexpr int   kLfeCutCount = 5;
+    static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 60.0f, 80.0f, 100.0f, 120.0f};
+    float m_paramLfeCut = 0.2f;  // 60 Hz
+    int   LfeCutIndex() const;
+    float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
+
     // Processing state
     UpmixEngine m_engine;
     float m_sampleRate = 48000.0f;
@@ -133,7 +146,17 @@ private:
     MultibandSplitter m_spatialSplitter;
     StereoCorrelationAnalyzer m_spatialCorrelation;
     TransientDetector m_spatialTransients;
-    BiquadFilter m_spatialLfeLowpass;
+    // LR4 lowpass feeding OBJ_SUBBASS at LfeCutoffHz(). Re-designed on the
+    // audio thread whenever the parameter moves; m_lfeCutoffApplied records
+    // the frequency the coefficients currently hold.
+    BiquadFilter m_spatialLfeLowpass[2];
+    float m_lfeCutoffApplied = 0.0f;
+    // Send level when OBJ_SUBBASS rides the LFE bed. Receivers reproduce LFE
+    // 10 dB above a main channel, so 0.316 would put the sub at the same
+    // acoustic level the fronts give their own bass; 0.7 lands about +3 dB
+    // above that for weight below the fronts' cutoff. The single knob for
+    // subwoofer level in the stereo path.
+    static constexpr float kSubBedSend = 0.7f;
     Decorrelator m_spatialDecorr[8];
     bool m_spatialDspInitialized = false;
 
@@ -209,7 +232,7 @@ private:
     static constexpr float kLowMidEnvHighHz = 500.0f;
     // Gain relative to the delayed mid, before spatialExtGain. Surround pairs
     // receive the full amount, heights half.
-    static constexpr float kLowMidEnvGain       = 0.55f;
+    static constexpr float kLowMidEnvGain       = 0.35f;
     static constexpr float kLowMidEnvHeightGain = 0.5f;
 
     // --- Feature 3: Spectral-variance ambience extraction ---

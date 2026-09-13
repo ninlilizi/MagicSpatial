@@ -23,6 +23,7 @@ enum EditorCtrlID {
     ID_SURROUND_POS_COMBO = 1004,
     ID_GAIN_LABEL         = 1005,
     ID_GAIN_SLIDER        = 1006,
+    ID_LFE_CUT_COMBO      = 1007,
 };
 
 // Master-gain parameter mapping. Normalized 0..1 ↔ -12..+12 dB, 0.5 = unity.
@@ -69,6 +70,9 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             else if (id == ID_SURROUND_POS_COMBO) {
                 // sel: 0 = Side, 1 = Rear
                 plugin->m_paramSurroundPos = (sel == 0) ? 0.0f : 1.0f;
+            }
+            else if (id == ID_LFE_CUT_COMBO) {
+                plugin->m_paramLfeCut = static_cast<float>(sel) * 0.2f;
             }
         }
         return 0;
@@ -332,6 +336,22 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         UpdateSurroundPosVisibility(hwnd, m_paramSpeakers);
         y += 30;
 
+        // --- LFE cutoff combo ---
+        CreateWindowW(L"STATIC", L"LFE cut:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
+        HWND lfeCombo = CreateWindowW(L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            ctrlX, y, ctrlW, 160, hwnd,
+            reinterpret_cast<HMENU>(ID_LFE_CUT_COMBO), hInst, nullptr);
+        for (int i = 0; i < kLfeCutCount; ++i) {
+            wchar_t txt[16];
+            swprintf(txt, 16, L"%d Hz", static_cast<int>(kLfeCutChoices[i]));
+            SendMessageW(lfeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(txt));
+        }
+        SendMessageW(lfeCombo, CB_SETCURSEL, LfeCutIndex(), 0);
+        y += 30;
+
         // --- Master Volume (shared-mode output gain) ---
         // Continuous -12..+12 dB trim on everything we emit. Helpful when
         // shared-mode Atmos arrives quieter than stereo. Does NOT touch
@@ -388,6 +408,7 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             case 1: std::strncpy(buf, "Speakers",    kVstMaxParamStrLen); break;
             case 2: std::strncpy(buf, "SurroundPos", kVstMaxParamStrLen); break;
             case 3: std::strncpy(buf, "Volume",      kVstMaxParamStrLen); break;
+            case 4: std::strncpy(buf, "LfeCut",      kVstMaxParamStrLen); break;
             }
         }
         return 0;
@@ -424,6 +445,10 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
                 std::snprintf(buf, kVstMaxParamStrLen, "%+.1f dB",
                               GainNormToDb(m_paramMasterGain));
                 break;
+            case 4:
+                std::snprintf(buf, kVstMaxParamStrLen, "%d Hz",
+                              static_cast<int>(LfeCutoffHz()));
+                break;
             }
         }
         return 0;
@@ -455,7 +480,15 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
     case 3:
         m_paramMasterGain = value;
         break;
+    case 4:
+        m_paramLfeCut = value;
+        break;
     }
+}
+
+int MagicSpatialVst::LfeCutIndex() const {
+    int idx = static_cast<int>(m_paramLfeCut / 0.2f + 0.5f);
+    return std::clamp(idx, 0, kLfeCutCount - 1);
 }
 
 float MagicSpatialVst::GetParameter(VstInt32 index) {
@@ -464,6 +497,7 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     case 1: return m_paramSpeakers;
     case 2: return m_paramSurroundPos;
     case 3: return m_paramMasterGain;
+    case 4: return m_paramLfeCut;
     default: return 0.0f;
     }
 }
@@ -789,7 +823,7 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_spatialSplitter.Initialize(sr, maxFrames);
     m_spatialCorrelation.Initialize(sr);
     m_spatialTransients.Initialize(sr);
-    m_spatialLfeLowpass.SetCoeffs(DesignLowpass(80.0f, sr));
+    m_lfeCutoffApplied = 0.0f;  // forces a coefficient design on the first block
 
     const auto* presets = GetDecorrelatorPresets();
     for (int i = 0; i < 8; ++i) {
@@ -846,19 +880,21 @@ void MagicSpatialVst::InitSpatialDsp() {
         }
         m_sLowMid.resize(maxFrames);
 
-        // Delays land in the early-reflection window once the 8 ms rear
-        // pre-delay is added; break frequencies spread across the band so
-        // every copy carries a different phase signature.
+        // Delays are kept short: the decorrelation comes mostly from the
+        // allpass phase dispersion, because anything beyond a few ms here
+        // (stacked on the 8 ms rear pre-delay) reads as a discrete echo of
+        // every kick rather than as room body. Break frequencies spread
+        // across the band so every copy carries a different phase signature.
         struct LowMidPreset { float delayMs; float breakHz[3]; };
         static constexpr LowMidPreset kPresets[8] = {
-            { 9.0f, { 90.0f, 180.0f, 340.0f}},   // SL
-            {13.0f, {110.0f, 230.0f, 400.0f}},   // SR
-            {15.0f, { 80.0f, 200.0f, 360.0f}},   // BL
-            {11.0f, {130.0f, 260.0f, 450.0f}},   // BR
-            {17.0f, {100.0f, 170.0f, 300.0f}},   // TFL
-            { 7.0f, {120.0f, 250.0f, 420.0f}},   // TFR
-            {19.0f, { 85.0f, 210.0f, 380.0f}},   // TBL
-            {21.0f, {140.0f, 190.0f, 330.0f}},   // TBR
+            {3.0f, { 90.0f, 180.0f, 340.0f}},   // SL
+            {5.0f, {110.0f, 230.0f, 400.0f}},   // SR
+            {6.0f, { 80.0f, 200.0f, 360.0f}},   // BL
+            {4.0f, {130.0f, 260.0f, 450.0f}},   // BR
+            {5.5f, {100.0f, 170.0f, 300.0f}},   // TFL
+            {2.5f, {120.0f, 250.0f, 420.0f}},   // TFR
+            {6.5f, { 85.0f, 210.0f, 380.0f}},   // TBL
+            {3.5f, {140.0f, 190.0f, 330.0f}},   // TBR
         };
         for (int i = 0; i < 8; ++i) {
             float coeffs[3];
@@ -1035,12 +1071,16 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
     }
 
-    // Adds a decorrelated copy of the low-mid body to dst, in phase, with no
-    // transient duck so the rear pair answers a kick like a real room.
+    // Adds a decorrelated copy of the low-mid body to dst, in phase. Ducked on
+    // transients like every other surround feed: an unducked delayed kick
+    // from behind is heard as an echo, not as envelopment.
     auto addLowMidEnv = [&](int decorrIndex, float* dst, float gain) {
         m_lowMidDecorr[decorrIndex].Process(m_sLowMid.data(), m_sScratch.data(), frames);
         const float g = gain * spatialExtGain * ambFactor[1];
-        for (uint32_t i = 0; i < frames; ++i) dst[i] += m_sScratch[i] * g;
+        for (uint32_t i = 0; i < frames; ++i) {
+            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            dst[i] += m_sScratch[i] * g * tDuck;
+        }
     };
 
     // Dynamic L/R position steering: compute energy balance on the delayed mid
@@ -1153,8 +1193,22 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_TOP_BACK_R,  +hxMag, hy, hzBack);
     }
 
-    // --- OBJ_SUBBASS: 80 Hz lowpass of the DELAYED ORIGINAL mid ---
-    m_spatialLfeLowpass.Process(m_sFullMid.data(), m_sScratch.data(), frames);
+    // --- OBJ_SUBBASS: LR4 lowpass (LfeCutoffHz) of the DELAYED ORIGINAL mid ---
+    // On the LFE bed the receiver adds 10 dB, so scale by kSubBedSend; as a
+    // dynamic object it is bass-managed like a speaker and goes out as-is.
+    {
+        const float wantHz = LfeCutoffHz();
+        if (wantHz != m_lfeCutoffApplied) {
+            const auto lp = DesignLowpass(wantHz, m_sampleRate);
+            for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
+            m_lfeCutoffApplied = wantHz;
+        }
+    }
+    m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
+    m_spatialLfeLowpass[1].Process(m_sScratch.data(), m_sScratch.data(), frames);
+    if (m_spatialWriter.IsLfeBed()) {
+        for (uint32_t i = 0; i < frames; ++i) m_sScratch[i] *= kSubBedSend;
+    }
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
     // --- OBJ_VOCAL: discrete centre mixed IN ON TOP of the phantom ---

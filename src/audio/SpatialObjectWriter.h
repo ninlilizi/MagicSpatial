@@ -62,6 +62,12 @@ public:
     // Check if spatial audio is ready to receive objects.
     bool IsActive() const { return m_active.load(std::memory_order_acquire); }
 
+    // True when OBJ_SUBBASS is carried as the stream's static LFE bed channel
+    // rather than a positioned dynamic object. An LFE bed reaches the
+    // subwoofer input directly, bypassing the renderer's speaker bass
+    // management; the receiver plays it 10 dB hotter than a main channel.
+    bool IsLfeBed() const { return m_lfeIsBed.load(std::memory_order_acquire); }
+
     // Did activation fail? (call after a reasonable timeout)
     bool HasFailed() const { return m_failed.load(std::memory_order_acquire); }
 
@@ -120,6 +126,11 @@ private:
         bool active = false;
     };
     DynamicObject m_objects[OBJ_COUNT];
+
+    // Set during stream activation when the endpoint offers a static LFE bed
+    // channel; OBJ_SUBBASS is then activated as AudioObjectType_LowFrequency
+    // and excluded from the dynamic pool accounting.
+    std::atomic<bool> m_lfeIsBed{false};
 
     HANDLE m_renderEvent = nullptr;
     UINT32 m_maxFrameCount = 0;

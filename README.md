@@ -8,14 +8,14 @@ Stereo input first runs through a streaming STFT that extracts the phantom centr
 
 | Object | Content | Position |
 |---|---|---|
-| Sub-bass | Lowpassed mid | Front centre, bass-managed to the sub |
+| Sub-bass | Mid below LfeCut (LR4) | LFE bed channel (direct to sub); dynamic object at front centre if the endpoint has no bed |
 | Vocal | Per-bin spectral centre (temporally smoothed) | Front centre (steered) |
 | Left / Right | Delayed L/R with the spectral centre peeled out | Front L/R (steered) |
 | Side L/R | Decorrelated band ambient, transient-ducked, plus low-mid body | ±90° (or rear, per SurroundPos) |
 | Back L/R | Presence-band ambient, plus low-mid body | ±135° |
 | Top-front / -back L/R | Side-signal band blends, brightness-steered elevation | Overhead front / rear |
 
-Because bass and low-mids are mono in nearly every mix, the side signal carries nothing below ~300 Hz; a separate 100-500 Hz feed from the mid signal is decorrelated with long delays and low-break allpasses and added in phase to the surrounds and heights, so the envelopment has body rather than presence alone. Side and back objects also receive an early-reflection pre-delay and a light feedback-diffusion tail for a sense of depth. 5.1/7.1 input is promoted straight to positioned objects with no remixing; if spatial output is unavailable, a channel-based upmix is used instead.
+Because bass and low-mids are mono in nearly every mix, the side signal carries nothing below ~300 Hz; a separate 100-500 Hz feed from the mid signal is decorrelated with short delays and low-break allpasses and added in phase to the surrounds and heights, so the envelopment has body rather than presence alone. Side and back objects also receive an early-reflection pre-delay and a light feedback-diffusion tail for a sense of depth. 5.1/7.1 input is promoted straight to positioned objects with no remixing; if spatial output is unavailable, a channel-based upmix is used instead.
 
 ## Requirements
 
@@ -43,8 +43,9 @@ VSTPlugin: Library "C:\Program Files\EqualizerAPO\VSTPlugins\MagicSpatial.dll"
 | **Speakers** | 2.0 (Headphones), 5.1.2, 5.1.4, 7.1.2, 7.1.4 | 5.1.2 |
 | **SurroundPos** | Side (90°), Rear (135°) — only for 5.1/5.1.2/5.1.4 | Rear |
 | **Volume** | -12…+12 dB master output trim | 0 dB |
+| **LfeCut** | 40 / 60 / 80 / 100 / 120 Hz sub-bass crossover | 60 Hz |
 
-**Mode** controls input detection. Auto analyses channel activity and selects the appropriate path. **Speakers** is used by the channel-based fallback when spatial audio is unavailable. **Volume** applies a master gain to everything the plugin emits (spatial objects and channel fallback alike), useful when shared-mode Atmos arrives quieter than stereo. Note it only affects audio that flows through the Windows shared-mode mixer — exclusive-mode and bitstream-passthrough streams bypass all APOs and are untouched.
+**LfeCut** sets the frequency below which the mid signal is handed to the LFE bed; set it to your front speakers' own low-frequency limit so the sub takes over exactly where they stop. **Mode** controls input detection. Auto analyses channel activity and selects the appropriate path. **Speakers** is used by the channel-based fallback when spatial audio is unavailable. **Volume** applies a master gain to everything the plugin emits (spatial objects and channel fallback alike), useful when shared-mode Atmos arrives quieter than stereo. Note it only affects audio that flows through the Windows shared-mode mixer — exclusive-mode and bitstream-passthrough streams bypass all APOs and are untouched.
 
 ## Building
 

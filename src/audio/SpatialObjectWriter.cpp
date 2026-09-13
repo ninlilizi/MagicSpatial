@@ -590,11 +590,22 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
     auto* notify = new SpatialNotify();
     notify->SetCountSink(&m_notifiedAvailable);
 
+    // Carry the sub-bass as a static LFE bed channel when the endpoint offers
+    // one. A dynamic object placed at a speaker only reaches the subwoofer
+    // through that speaker's bass management, which proved nearly inaudible on
+    // the reference rig; the LFE bed feeds the sub input directly.
+    AudioObjectType nativeStatic = AudioObjectType_None;
+    hr = m_spatialClient->GetNativeStaticObjectTypeMask(&nativeStatic);
+    const bool lfeBed = SUCCEEDED(hr) && (nativeStatic & AudioObjectType_LowFrequency) != 0;
+    m_lfeIsBed.store(lfeBed, std::memory_order_release);
+    Log("[SpatialObjectWriter] Native static mask 0x%08X -> LFE bed %s\n",
+        static_cast<unsigned>(nativeStatic), lfeBed ? "yes" : "no (dynamic fallback)");
+
     SpatialAudioObjectRenderStreamActivationParams streamParams{};
     streamParams.ObjectFormat = m_objectFormat;
-    streamParams.StaticObjectTypeMask = AudioObjectType_None; // No static objects
+    streamParams.StaticObjectTypeMask = lfeBed ? AudioObjectType_LowFrequency : AudioObjectType_None;
     streamParams.MinDynamicObjectCount = 1;
-    streamParams.MaxDynamicObjectCount = static_cast<UINT32>(OBJ_COUNT);
+    streamParams.MaxDynamicObjectCount = static_cast<UINT32>(OBJ_COUNT) - (lfeBed ? 1u : 0u);
     streamParams.Category = AudioCategory_Media;
     streamParams.EventHandle = m_renderEvent;
     streamParams.NotifyObject = notify;
@@ -661,16 +672,25 @@ UINT32 SpatialObjectWriter::ActivateObjects() {
     // existing stream is ordinary lifecycle — unlike re-activating the *stream*,
     // which is the manoeuvre that destabilised the two-instance contention.
     UINT32 activated = 0;
+    const bool lfeBed = m_lfeIsBed.load(std::memory_order_acquire);
     for (int i = 0; i < OBJ_COUNT; ++i) {
         if (m_objects[i].active && m_objects[i].object) {
             ++activated;
             continue;
         }
+        const bool isBed = lfeBed && i == OBJ_SUBBASS;
         HRESULT hr = m_renderStream->ActivateSpatialAudioObject(
-            AudioObjectType_Dynamic, m_objects[i].object.GetAddressOf());
+            isBed ? AudioObjectType_LowFrequency : AudioObjectType_Dynamic,
+            m_objects[i].object.GetAddressOf());
         if (SUCCEEDED(hr) && m_objects[i].object) {
             m_objects[i].active = true;
             ++activated;
+        } else if (isBed) {
+            // The bed channel is ours alone and never contended; a failure here
+            // is a one-off, not a sign the dynamic pool is exhausted.
+            Log("[SpatialObjectWriter] LFE bed activation failed: 0x%08lX\n",
+                static_cast<unsigned long>(hr));
+            m_objects[i].active = false;
         } else {
             // Pool exhausted — a peer holds the rest. Stop and report what we have.
             m_objects[i].active = false;
@@ -752,8 +772,10 @@ void SpatialObjectWriter::RenderLoop() {
             for (int i = 0; i < OBJ_COUNT; ++i) {
                 if (!m_objects[i].active || !m_objects[i].object) continue;
 
-                auto& pos = m_objects[i].position;
-                m_objects[i].object->SetPosition(pos.x, pos.y, pos.z);
+                if (!(i == OBJ_SUBBASS && m_lfeIsBed.load(std::memory_order_relaxed))) {
+                    auto& pos = m_objects[i].position;
+                    m_objects[i].object->SetPosition(pos.x, pos.y, pos.z);
+                }
                 m_objects[i].object->SetVolume(1.0f);
 
                 BYTE* buffer = nullptr;
@@ -822,7 +844,9 @@ void SpatialObjectWriter::RenderLoop() {
             // YIELDED: holding no objects. Idle on the stream and watch the free
             // pool. When it can fit our whole baseline again — sustained past the
             // reclaim debounce — re-claim our objects and resume.
-            if (m_objectTarget > 0 && availableDynamic >= m_objectTarget) {
+            const UINT32 dynamicTarget = m_objectTarget
+                - (m_lfeIsBed.load(std::memory_order_relaxed) ? 1u : 0u);
+            if (dynamicTarget > 0 && availableDynamic >= dynamicTarget) {
                 const ULONGLONG now = GetTickCount64();
                 if (roomSince == 0) {
                     roomSince = now;
