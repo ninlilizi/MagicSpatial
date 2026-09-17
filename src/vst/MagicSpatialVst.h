@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <string>
 #include "vst/VstDefs.h"
@@ -39,11 +40,12 @@ enum class SpeakerLayout {
 //   2 - SurroundPos: Side / Rear
 //   3 - Volume:   -12..+12 dB
 //   4 - LfeCut:   40 / 60 / 80 / 100 / 120 Hz sub-bass crossover
+//   5 - LfeOverlap: 0 / 20 / 40 Hz band shared by the sub and the mains
 class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
     static constexpr int kNumOutputs = 12;
-    static constexpr int kNumParams  = 5;
+    static constexpr int kNumParams  = 6;
 
     static constexpr VstInt32 kUniqueID = 'MgSp';
 
@@ -80,7 +82,7 @@ private:
     audioMasterCallback m_hostCallback;
 
     // Editor
-    ERect m_editorRect{0, 0, 190, 340};
+    ERect m_editorRect{0, 0, 250, 340};
     void* m_editorHwnd = nullptr;  // HWND of our child window
 
     // Parameters
@@ -108,9 +110,28 @@ private:
     // sel * 0.2 over kLfeCutChoices; decoded at the midpoints.
     static constexpr int   kLfeCutCount = 5;
     static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 60.0f, 80.0f, 100.0f, 120.0f};
-    float m_paramLfeCut = 0.2f;  // 60 Hz
+    float m_paramLfeCut = 0.4f;  // 80 Hz
     int   LfeCutIndex() const;
     float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
+
+    // Crossover overlap: how far BELOW the sub's corner the mains' highpass
+    // sits. At zero the two filters are complementary and the acoustic sum is
+    // flat. Any other value leaves a band that both the sub and the mains
+    // reproduce, which sums to a broad lift of roughly +2..3 dB across that
+    // band — deliberate weight rather than a flat handover. Combo encoding is
+    // sel * 0.5 over kLfeOverlapChoices; decoded at the midpoints.
+    static constexpr int   kLfeOverlapCount = 3;
+    static constexpr float kLfeOverlapChoices[kLfeOverlapCount] = {0.0f, 20.0f, 40.0f};
+    // Floor for the mains' corner so a wide overlap on a low LfeCut cannot
+    // walk the highpass down toward DC and hand the fronts cone excursion
+    // they have no business reproducing.
+    static constexpr float kMainsCutFloorHz = 35.0f;
+    float m_paramLfeOverlap = 0.5f;  // 20 Hz
+    int   LfeOverlapIndex() const;
+    float LfeOverlapHz() const { return kLfeOverlapChoices[LfeOverlapIndex()]; }
+    float MainsCutoffHz() const {
+        return std::max(LfeCutoffHz() - LfeOverlapHz(), kMainsCutFloorHz);
+    }
 
     // Processing state
     UpmixEngine m_engine;
@@ -158,9 +179,11 @@ private:
     // highpassed. Multichannel path: every non-LFE channel is highpassed to
     // its object and its lowpassed remainder is summed into the LFE bed, so a
     // game's rear or height bass reaches the sub even where the renderer's
-    // own bass management does not. All coefficients are re-designed on the
-    // audio thread when the selector moves; m_lfeCutoffApplied records the
-    // frequency currently held.
+    // own bass management does not. The lowpasses sit at LfeCutoffHz() and the
+    // highpasses at MainsCutoffHz(), which is LfeOverlapHz() lower — equal
+    // when the overlap is off. All coefficients are re-designed on the audio
+    // thread when either selector moves; the two applied members record the
+    // pair currently held.
     BiquadFilter m_spatialLfeLowpass[2];
     BiquadFilter m_frontHp[2][2];              // [L/R][stage]
     BiquadFilter m_mcHp[kNumInputs][2];
@@ -168,6 +191,7 @@ private:
     std::vector<float> m_mcHpOut;
     std::vector<float> m_mcBedSum;
     float m_lfeCutoffApplied = 0.0f;
+    float m_mainsCutoffApplied = 0.0f;
     void ApplyLfeCutoff();
     // Redirected bass joins the LFE bed 10 dB down so that, after the
     // receiver's +10 dB LFE gain, it plays at the level its own speaker would

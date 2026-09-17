@@ -24,6 +24,7 @@ enum EditorCtrlID {
     ID_GAIN_LABEL         = 1005,
     ID_GAIN_SLIDER        = 1006,
     ID_LFE_CUT_COMBO      = 1007,
+    ID_LFE_OVERLAP_COMBO  = 1008,
 };
 
 // Master-gain parameter mapping. Normalized 0..1 ↔ -12..+12 dB, 0.5 = unity.
@@ -73,6 +74,9 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             else if (id == ID_LFE_CUT_COMBO) {
                 plugin->m_paramLfeCut = static_cast<float>(sel) * 0.2f;
+            }
+            else if (id == ID_LFE_OVERLAP_COMBO) {
+                plugin->m_paramLfeOverlap = static_cast<float>(sel) * 0.5f;
             }
         }
         return 0;
@@ -352,6 +356,26 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         SendMessageW(lfeCombo, CB_SETCURSEL, LfeCutIndex(), 0);
         y += 30;
 
+        // --- Crossover overlap combo ---
+        // Shown as the width of the band the sub and the mains share, so the
+        // pair reads directly: "LFE cut: 80 Hz" with "Overlap: 20 Hz" means
+        // the sub takes everything under 80 and the fronts still run to 60.
+        CreateWindowW(L"STATIC", L"Overlap:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
+        HWND overlapCombo = CreateWindowW(L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            ctrlX, y, ctrlW, 120, hwnd,
+            reinterpret_cast<HMENU>(ID_LFE_OVERLAP_COMBO), hInst, nullptr);
+        for (int i = 0; i < kLfeOverlapCount; ++i) {
+            wchar_t txt[16];
+            if (kLfeOverlapChoices[i] == 0.0f) swprintf(txt, 16, L"None");
+            else swprintf(txt, 16, L"%d Hz", static_cast<int>(kLfeOverlapChoices[i]));
+            SendMessageW(overlapCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(txt));
+        }
+        SendMessageW(overlapCombo, CB_SETCURSEL, LfeOverlapIndex(), 0);
+        y += 30;
+
         // --- Master Volume (shared-mode output gain) ---
         // Continuous -12..+12 dB trim on everything we emit. Helpful when
         // shared-mode Atmos arrives quieter than stereo. Does NOT touch
@@ -409,6 +433,7 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             case 2: std::strncpy(buf, "SurroundPos", kVstMaxParamStrLen); break;
             case 3: std::strncpy(buf, "Volume",      kVstMaxParamStrLen); break;
             case 4: std::strncpy(buf, "LfeCut",      kVstMaxParamStrLen); break;
+            case 5: std::strncpy(buf, "LfeOverlap",  kVstMaxParamStrLen); break;
             }
         }
         return 0;
@@ -449,6 +474,12 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
                 std::snprintf(buf, kVstMaxParamStrLen, "%d Hz",
                               static_cast<int>(LfeCutoffHz()));
                 break;
+            case 5:
+                if (LfeOverlapHz() == 0.0f) std::strncpy(buf, "None", kVstMaxParamStrLen);
+                else std::snprintf(buf, kVstMaxParamStrLen, "%d Hz (mains %d)",
+                                   static_cast<int>(LfeOverlapHz()),
+                                   static_cast<int>(MainsCutoffHz()));
+                break;
             }
         }
         return 0;
@@ -483,12 +514,20 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
     case 4:
         m_paramLfeCut = value;
         break;
+    case 5:
+        m_paramLfeOverlap = value;
+        break;
     }
 }
 
 int MagicSpatialVst::LfeCutIndex() const {
     int idx = static_cast<int>(m_paramLfeCut / 0.2f + 0.5f);
     return std::clamp(idx, 0, kLfeCutCount - 1);
+}
+
+int MagicSpatialVst::LfeOverlapIndex() const {
+    int idx = static_cast<int>(m_paramLfeOverlap / 0.5f + 0.5f);
+    return std::clamp(idx, 0, kLfeOverlapCount - 1);
 }
 
 float MagicSpatialVst::GetParameter(VstInt32 index) {
@@ -498,6 +537,7 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     case 2: return m_paramSurroundPos;
     case 3: return m_paramMasterGain;
     case 4: return m_paramLfeCut;
+    case 5: return m_paramLfeOverlap;
     default: return 0.0f;
     }
 }
@@ -933,9 +973,10 @@ void MagicSpatialVst::InitSpatialDsp() {
 
 void MagicSpatialVst::ApplyLfeCutoff() {
     const float wantHz = LfeCutoffHz();
-    if (wantHz == m_lfeCutoffApplied) return;
+    const float mainsHz = MainsCutoffHz();
+    if (wantHz == m_lfeCutoffApplied && mainsHz == m_mainsCutoffApplied) return;
     const auto lp = DesignLowpass(wantHz, m_sampleRate);
-    const auto hp = DesignHighpass(wantHz, m_sampleRate);
+    const auto hp = DesignHighpass(mainsHz, m_sampleRate);
     for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
     for (auto& pair : m_frontHp) for (auto& f : pair) f.SetCoeffs(hp);
     for (int ch = 0; ch < kNumInputs; ++ch) {
@@ -943,6 +984,7 @@ void MagicSpatialVst::ApplyLfeCutoff() {
         for (auto& f : m_mcLp[ch]) f.SetCoeffs(lp);
     }
     m_lfeCutoffApplied = wantHz;
+    m_mainsCutoffApplied = mainsHz;
 }
 
 void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
@@ -1249,9 +1291,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_sResidualL[i] *= kFrontGain;
         m_sResidualR[i] *= kFrontGain;
     }
-    // Hand everything below LfeCut to the sub (OBJ_SUBBASS carries the
-    // complementary lowpass) so the fronts play down to their own limit and
-    // no further, and the bass is reproduced exactly once.
+    // Highpass the fronts at MainsCutoffHz so they stop where the speakers
+    // do. With the overlap off that is LfeCut itself and the sub's lowpass is
+    // complementary — each frequency plays once. With an overlap the fronts
+    // reach below the sub's corner and the shared band is reproduced twice,
+    // summing to a deliberate lift through the low bass.
     for (auto& f : m_frontHp[0]) f.Process(m_sResidualL.data(), m_sResidualL.data(), frames);
     for (auto& f : m_frontHp[1]) f.Process(m_sResidualR.data(), m_sResidualR.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
@@ -1528,10 +1572,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 //
 // No spectral separation, no delay, no remixing. Genuine multichannel content
 // (games, films) keeps its directional cues intact. The one thing added is
-// bass management at LfeCut: each channel is highpassed to its object and the
-// remainder is summed into the LFE bed beside the source's own LFE, so bass
-// from every direction reaches the sub regardless of what the renderer's
-// bass management does with object feeds. Any stereo content that Windows
+// bass management: each channel is highpassed at MainsCutoffHz to its object
+// and its content below LfeCut is summed into the LFE bed beside the source's
+// own LFE, so bass from every direction reaches the sub regardless of what the
+// renderer's bass management does with object feeds. Any overlap between the
+// two corners is carried by both and lifts the low bass. Any stereo content that Windows
 // mixed into the front pair stays in OBJ_LEFT/OBJ_RIGHT — the tradeoff:
 // stereo apps lose spatial enhancement when a multichannel source is active,
 // but multichannel fidelity is preserved.
