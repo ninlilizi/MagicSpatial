@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <string>
 #include "vst/VstDefs.h"
@@ -40,7 +41,7 @@ enum class SpeakerLayout {
 //   2 - SurroundPos: Side / Rear
 //   3 - Volume:   -12..+12 dB
 //   4 - LfeCut:   40 / 60 / 80 / 100 / 120 Hz sub-bass crossover
-//   5 - LfeOverlap: 0 / 20 / 40 Hz band shared by the sub and the mains
+//   5 - SubLevel: -12..+6 dB of sub weight around a level match with bypass
 class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
@@ -110,28 +111,10 @@ private:
     // sel * 0.2 over kLfeCutChoices; decoded at the midpoints.
     static constexpr int   kLfeCutCount = 5;
     static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 60.0f, 80.0f, 100.0f, 120.0f};
-    float m_paramLfeCut = 0.4f;  // 80 Hz
+    float m_paramLfeCut = 0.2f;  // 60 Hz
     int   LfeCutIndex() const;
     float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
 
-    // Crossover overlap: how far BELOW the sub's corner the mains' highpass
-    // sits. At zero the two filters are complementary and the acoustic sum is
-    // flat. Any other value leaves a band that both the sub and the mains
-    // reproduce, which sums to a broad lift of roughly +2..3 dB across that
-    // band — deliberate weight rather than a flat handover. Combo encoding is
-    // sel * 0.5 over kLfeOverlapChoices; decoded at the midpoints.
-    static constexpr int   kLfeOverlapCount = 3;
-    static constexpr float kLfeOverlapChoices[kLfeOverlapCount] = {0.0f, 20.0f, 40.0f};
-    // Floor for the mains' corner so a wide overlap on a low LfeCut cannot
-    // walk the highpass down toward DC and hand the fronts cone excursion
-    // they have no business reproducing.
-    static constexpr float kMainsCutFloorHz = 35.0f;
-    float m_paramLfeOverlap = 0.5f;  // 20 Hz
-    int   LfeOverlapIndex() const;
-    float LfeOverlapHz() const { return kLfeOverlapChoices[LfeOverlapIndex()]; }
-    float MainsCutoffHz() const {
-        return std::max(LfeCutoffHz() - LfeOverlapHz(), kMainsCutFloorHz);
-    }
 
     // Processing state
     UpmixEngine m_engine;
@@ -179,11 +162,11 @@ private:
     // highpassed. Multichannel path: every non-LFE channel is highpassed to
     // its object and its lowpassed remainder is summed into the LFE bed, so a
     // game's rear or height bass reaches the sub even where the renderer's
-    // own bass management does not. The lowpasses sit at LfeCutoffHz() and the
-    // highpasses at MainsCutoffHz(), which is LfeOverlapHz() lower — equal
-    // when the overlap is off. All coefficients are re-designed on the audio
-    // thread when either selector moves; the two applied members record the
-    // pair currently held.
+    // own bass management does not. Both sides sit at LfeCutoffHz() and are
+    // complementary, so every frequency is reproduced exactly once and the
+    // acoustic sum is flat. All coefficients are re-designed on the audio
+    // thread when the selector moves; m_lfeCutoffApplied records the frequency
+    // currently held.
     BiquadFilter m_spatialLfeLowpass[2];
     BiquadFilter m_frontHp[2][2];              // [L/R][stage]
     BiquadFilter m_mcHp[kNumInputs][2];
@@ -191,18 +174,36 @@ private:
     std::vector<float> m_mcHpOut;
     std::vector<float> m_mcBedSum;
     float m_lfeCutoffApplied = 0.0f;
-    float m_mainsCutoffApplied = 0.0f;
     void ApplyLfeCutoff();
-    // Redirected bass joins the LFE bed 10 dB down so that, after the
-    // receiver's +10 dB LFE gain, it plays at the level its own speaker would
-    // have given it. Unity when the sub rides a dynamic object instead.
-    static constexpr float kBassRedirectGain = 0.316f;
-    // Send level when OBJ_SUBBASS rides the LFE bed. Receivers reproduce LFE
-    // 10 dB above a main channel, so 0.316 would put the sub at the same
-    // acoustic level the fronts give their own bass; 0.7 lands about +3 dB
-    // above that for weight below the fronts' cutoff. The single knob for
-    // subwoofer level in the stereo path.
-    static constexpr float kSubBedSend = 0.7f;
+    // Level at which redirected bass joins the LFE bed. This was 0.316, a 10 dB
+    // cut to leave room for the +10 dB lift an LFE channel receives in Dolby
+    // Digital, DTS and their kin. That lift never arrives here. It belongs to
+    // bitstream formats, where the decoder applies it on the way out; an
+    // ISpatialAudioClient bed takes linear PCM and there is no decode step to
+    // apply any such convention, so what we write is what the sub plays.
+    //
+    // The listening bears it out. With the sub carrying everything below the
+    // mains' corner the bass measured flat on the assumption of a lift and yet
+    // sounded a full measure shy, and that same 10 dB deficit accounts for
+    // every report across three rounds of tuning. Unity it is.
+    static constexpr float kBassRedirectGain = 1.0f;
+    // Sub weight above a level match with the effect bypassed. Parity itself is
+    // derived, not guessed: see the OBJ_SUBBASS submission. This is the single
+    // knob for subwoofer level in the stereo path, and 0 dB means the sub puts
+    // exactly as much bass into the room as the untouched stereo pair did.
+    // Combo encoding is sel / 6 over kSubLevelChoicesDb; decoded at the
+    // midpoints.
+    // The range spans both directions on purpose. Match is the derived parity,
+    // and it now rests on kBassRedirectGain being right; should that judgement
+    // prove wrong, the negative steps reach back to where the sub sat before
+    // without another rebuild.
+    static constexpr int   kSubLevelCount = 7;
+    static constexpr float kSubLevelChoicesDb[kSubLevelCount] =
+        {-12.0f, -9.0f, -6.0f, -3.0f, 0.0f, 3.0f, 6.0f};
+    float m_paramSubLevel = 4.0f / 6.0f;  // Match
+    int   SubLevelIndex() const;
+    float SubLevelDb() const { return kSubLevelChoicesDb[SubLevelIndex()]; }
+    float SubLevelLinear() const { return std::pow(10.0f, SubLevelDb() / 20.0f); }
     Decorrelator m_spatialDecorr[8];
     bool m_spatialDspInitialized = false;
 
@@ -280,6 +281,78 @@ private:
     // receive the full amount, heights half.
     static constexpr float kLowMidEnvGain       = 0.55f;
     static constexpr float kLowMidEnvHeightGain = 0.5f;
+
+    // --- Wash bass management ---
+    // The surround and height speakers are smaller than the fronts and crossed
+    // higher, so whatever the wash carries below kWashCutHz is excursion those
+    // drivers spend without making sound - and a small driver pushed on notes
+    // it cannot reproduce hands back intermodulation, which reads as harshness
+    // rather than as bass. Every wash object is highpassed here and the summed
+    // remainder joins the LFE bed, so that energy arrives from the sub instead
+    // of being lost in the surrounds. The multichannel path has always done
+    // exactly this for its own channels; the stereo path did it only for the
+    // fronts.
+    //
+    // Antiphase content cancels in the sum, and that is correct rather than a
+    // loss: the side signal is inverted between left and right, and at these
+    // wavelengths a symmetric pair cancels it at the seat in any case. The
+    // low-mid envelopment feed is added in phase, so it survives, and it is
+    // what mostly makes the journey to the sub.
+    static constexpr float kWashCutHz = 120.0f;
+    BiquadFilter m_washHp[8][2];    // [object][stage]
+    BiquadFilter m_washLp[2];       // on the summed redirect
+    std::vector<float> m_sWashLow;  // wash sum awaiting that lowpass
+    std::vector<float> m_sSubOut;   // sub feed, held until the wash folds in
+
+    // --- Spatial energy budget ---
+    // The upmix sprays one stereo pair across up to eight further speakers.
+    // Summed around the room that is a great deal more acoustic power than the
+    // front pair alone would have made, and because every surround and height
+    // object is built from the L-R SIDE signal - which is mid and treble heavy,
+    // bass being mono in nearly every mix - the surplus lands almost entirely
+    // above the bass. The image lifts and brightens, and the sub, still just
+    // one driver's worth of output, is left outgunned.
+    //
+    // These two shares divide the stereo bypass power between the direct front
+    // pair and the surround/height wash, so the total in the room comes back to
+    // what the fronts alone would have given. They should sum to 1. The sub is
+    // deliberately outside the budget: holding it still while everything around
+    // it comes down is exactly how it regains its footing.
+    static constexpr float kDirectShare = 0.75f;
+    static constexpr float kWashShare   = 0.25f;
+    // The wash cannot be measured until it has been built, so each block is
+    // scaled by the ratio the previous block computed and the result is
+    // smoothed over kWashNormTau. Ceilinged at unity so this only ever reins
+    // in: near-mono material, whose side signal is already faint, keeps the
+    // voicing it has rather than being hauled up to fill the budget.
+    static constexpr float kWashNormMin = 0.10f;
+    static constexpr float kWashNormTau = 0.5f;  // seconds
+    float m_washNormGain = 1.0f;
+
+    // The budget is divided BAND BY BAND as well as in total. A broadband quota
+    // is drawn from the whole spectrum, which in music is dominated by the bass,
+    // yet the wash spends it wherever the side signal happens to live - and in
+    // most mixes that is the presence band, since the low end is mono and lead
+    // vocals are centred while reverb and wide synths are not. Measured on real
+    // programme, a broadband quota alone lands about +2.7 dB at 4 kHz against a
+    // stereo bypass while the extremes sit near +1, which is heard as the image
+    // brightening.
+    //
+    // m_washBandGain corrects that where the side bands are formed, which is
+    // where kBandBalance already applies a per-band multiply, so it costs one
+    // further scalar. Each band is weighed against ITS OWN bypass energy rather
+    // than the spectrum's, and the set is renormalised afterwards to leave the
+    // total untouched - that keeps m_washNormGain above in charge of the level
+    // and inside the range it already occupied, rather than driving it into its
+    // ceiling and quietly costing envelopment.
+    //
+    // kBandBalance and this do different jobs. kBandBalance flattens the wash's
+    // TRANSFER FUNCTION, and measurement says it manages that to within 1.3 dB
+    // from 250 Hz to 16 kHz. This flattens the wash's ENERGY against the
+    // programme, which no fixed constant can do, because it moves with the mix.
+    static constexpr float kWashBandMin = 0.25f;
+    static constexpr float kWashBandMax = 2.50f;
+    float m_washBandGain[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     // --- Feature 3: Spectral-variance ambience extraction ---
     int m_ambBinCount[4] = {0, 0, 0, 0};        // precomputed bin counts per band

@@ -24,7 +24,7 @@ enum EditorCtrlID {
     ID_GAIN_LABEL         = 1005,
     ID_GAIN_SLIDER        = 1006,
     ID_LFE_CUT_COMBO      = 1007,
-    ID_LFE_OVERLAP_COMBO  = 1008,
+    ID_SUB_LEVEL_COMBO    = 1008,
 };
 
 // Master-gain parameter mapping. Normalized 0..1 ↔ -12..+12 dB, 0.5 = unity.
@@ -75,8 +75,8 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             else if (id == ID_LFE_CUT_COMBO) {
                 plugin->m_paramLfeCut = static_cast<float>(sel) * 0.2f;
             }
-            else if (id == ID_LFE_OVERLAP_COMBO) {
-                plugin->m_paramLfeOverlap = static_cast<float>(sel) * 0.5f;
+            else if (id == ID_SUB_LEVEL_COMBO) {
+                plugin->m_paramSubLevel = static_cast<float>(sel) / 6.0f;
             }
         }
         return 0;
@@ -356,24 +356,23 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         SendMessageW(lfeCombo, CB_SETCURSEL, LfeCutIndex(), 0);
         y += 30;
 
-        // --- Crossover overlap combo ---
-        // Shown as the width of the band the sub and the mains share, so the
-        // pair reads directly: "LFE cut: 80 Hz" with "Overlap: 20 Hz" means
-        // the sub takes everything under 80 and the fronts still run to 60.
-        CreateWindowW(L"STATIC", L"Overlap:",
+        // --- Sub level combo ---
+        // 0 dB is a level match with the effect bypassed, so the readings are
+        // an honest "how much more sub than stereo gave me".
+        CreateWindowW(L"STATIC", L"Sub level:",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
-        HWND overlapCombo = CreateWindowW(L"COMBOBOX", L"",
+        HWND subCombo = CreateWindowW(L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            ctrlX, y, ctrlW, 120, hwnd,
-            reinterpret_cast<HMENU>(ID_LFE_OVERLAP_COMBO), hInst, nullptr);
-        for (int i = 0; i < kLfeOverlapCount; ++i) {
+            ctrlX, y, ctrlW, 160, hwnd,
+            reinterpret_cast<HMENU>(ID_SUB_LEVEL_COMBO), hInst, nullptr);
+        for (int i = 0; i < kSubLevelCount; ++i) {
             wchar_t txt[16];
-            if (kLfeOverlapChoices[i] == 0.0f) swprintf(txt, 16, L"None");
-            else swprintf(txt, 16, L"%d Hz", static_cast<int>(kLfeOverlapChoices[i]));
-            SendMessageW(overlapCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(txt));
+            if (kSubLevelChoicesDb[i] == 0.0f) swprintf(txt, 16, L"Match");
+            else swprintf(txt, 16, L"%+d dB", static_cast<int>(kSubLevelChoicesDb[i]));
+            SendMessageW(subCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(txt));
         }
-        SendMessageW(overlapCombo, CB_SETCURSEL, LfeOverlapIndex(), 0);
+        SendMessageW(subCombo, CB_SETCURSEL, SubLevelIndex(), 0);
         y += 30;
 
         // --- Master Volume (shared-mode output gain) ---
@@ -433,7 +432,7 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             case 2: std::strncpy(buf, "SurroundPos", kVstMaxParamStrLen); break;
             case 3: std::strncpy(buf, "Volume",      kVstMaxParamStrLen); break;
             case 4: std::strncpy(buf, "LfeCut",      kVstMaxParamStrLen); break;
-            case 5: std::strncpy(buf, "LfeOverlap",  kVstMaxParamStrLen); break;
+            case 5: std::strncpy(buf, "SubLevel",    kVstMaxParamStrLen); break;
             }
         }
         return 0;
@@ -475,10 +474,9 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
                               static_cast<int>(LfeCutoffHz()));
                 break;
             case 5:
-                if (LfeOverlapHz() == 0.0f) std::strncpy(buf, "None", kVstMaxParamStrLen);
-                else std::snprintf(buf, kVstMaxParamStrLen, "%d Hz (mains %d)",
-                                   static_cast<int>(LfeOverlapHz()),
-                                   static_cast<int>(MainsCutoffHz()));
+                if (SubLevelDb() == 0.0f) std::strncpy(buf, "Match", kVstMaxParamStrLen);
+                else std::snprintf(buf, kVstMaxParamStrLen, "%+d dB",
+                                   static_cast<int>(SubLevelDb()));
                 break;
             }
         }
@@ -515,7 +513,7 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
         m_paramLfeCut = value;
         break;
     case 5:
-        m_paramLfeOverlap = value;
+        m_paramSubLevel = value;
         break;
     }
 }
@@ -525,9 +523,9 @@ int MagicSpatialVst::LfeCutIndex() const {
     return std::clamp(idx, 0, kLfeCutCount - 1);
 }
 
-int MagicSpatialVst::LfeOverlapIndex() const {
-    int idx = static_cast<int>(m_paramLfeOverlap / 0.5f + 0.5f);
-    return std::clamp(idx, 0, kLfeOverlapCount - 1);
+int MagicSpatialVst::SubLevelIndex() const {
+    int idx = static_cast<int>(m_paramSubLevel * 6.0f + 0.5f);
+    return std::clamp(idx, 0, kSubLevelCount - 1);
 }
 
 float MagicSpatialVst::GetParameter(VstInt32 index) {
@@ -537,7 +535,7 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     case 2: return m_paramSurroundPos;
     case 3: return m_paramMasterGain;
     case 4: return m_paramLfeCut;
-    case 5: return m_paramLfeOverlap;
+    case 5: return m_paramSubLevel;
     default: return 0.0f;
     }
 }
@@ -896,6 +894,16 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_sDelayedL.resize(maxFrames); m_sDelayedR.resize(maxFrames);
     m_sCenter.resize(maxFrames);
     m_sResidualL.resize(maxFrames); m_sResidualR.resize(maxFrames);
+    m_sWashLow.resize(maxFrames); m_sSubOut.resize(maxFrames);
+
+    // Wash bass management. Fixed at kWashCutHz: it tracks the surround and
+    // height speakers' own crossover, not the fronts' LfeCut selector.
+    {
+        const auto washHp = DesignHighpass(kWashCutHz, sr);
+        const auto washLp = DesignLowpass(kWashCutHz, sr);
+        for (auto& obj : m_washHp) for (auto& f : obj) f.SetCoeffs(washHp);
+        for (auto& f : m_washLp) f.SetCoeffs(washLp);
+    }
 
     // Delay rings + scratch for stereo-aware multichannel extraction.
     // Only channels 2..11 need delaying; FL/FR (0/1) come out of the
@@ -973,10 +981,9 @@ void MagicSpatialVst::InitSpatialDsp() {
 
 void MagicSpatialVst::ApplyLfeCutoff() {
     const float wantHz = LfeCutoffHz();
-    const float mainsHz = MainsCutoffHz();
-    if (wantHz == m_lfeCutoffApplied && mainsHz == m_mainsCutoffApplied) return;
+    if (wantHz == m_lfeCutoffApplied) return;
     const auto lp = DesignLowpass(wantHz, m_sampleRate);
-    const auto hp = DesignHighpass(mainsHz, m_sampleRate);
+    const auto hp = DesignHighpass(wantHz, m_sampleRate);
     for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
     for (auto& pair : m_frontHp) for (auto& f : pair) f.SetCoeffs(hp);
     for (int ch = 0; ch < kNumInputs; ++ch) {
@@ -984,7 +991,6 @@ void MagicSpatialVst::ApplyLfeCutoff() {
         for (auto& f : m_mcLp[ch]) f.SetCoeffs(lp);
     }
     m_lfeCutoffApplied = wantHz;
-    m_mainsCutoffApplied = mainsHz;
 }
 
 void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
@@ -1028,6 +1034,16 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     const float* L = m_sDelayedL.data();
     const float* R = m_sDelayedR.data();
     const float* C = m_sCenter.data();
+
+    // Stereo bypass power for this block: what the front pair alone would have
+    // put into the room. L/R already carry kGlobalOutputGain, so undo it to get
+    // back to the untouched source level. This is the whole budget that the
+    // fronts and the surround/height wash divide between them.
+    float refEnergy = 0.0f;
+    for (uint32_t i = 0; i < frames; ++i) {
+        refEnergy += L[i] * L[i] + R[i] * R[i];
+    }
+    const float bypassPower = refEnergy / (kGlobalOutputGain * kGlobalOutputGain);
 
     // --- Residuals = delayed L/R, FULL (centre NOT subtracted) ---
     // The centred midrange stays on the full-range front pair (which reach
@@ -1112,11 +1128,30 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // gain to ~11.5, so the added wash is tonally neutral and the source's own
     // balance is preserved. (Derived for the 5.1.2 reference layout.)
     constexpr float kBandBalance[4] = {1.10f, 0.94f, 0.74f, 1.00f};
+
+    // Per-band budget: weigh each band's raw side energy against that band's own
+    // bypass energy. Measured here BEFORE kBandBalance and the trim so the two
+    // stay separable, and used at the end of the block to size the next one.
+    float bandSideE[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float bandBypassE[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b = 0; b < 4; ++b) {
+        const float* bl = bandL[b];
+        const float* br = bandR[b];
+        float es = 0.0f, eb = 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            const float sd = (bl[i] - br[i]) * 0.5f;
+            es += sd * sd;
+            eb += bl[i] * bl[i] + br[i] * br[i];
+        }
+        bandSideE[b] = es;
+        bandBypassE[b] = eb;
+    }
+
     for (uint32_t i = 0; i < frames; ++i) {
-        m_sSide0[i] = (bL0[i] - bR0[i]) * 0.5f * kBandBalance[0];
-        m_sSide1[i] = (bL1[i] - bR1[i]) * 0.5f * kBandBalance[1];
-        m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f * kBandBalance[2];
-        m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f * kBandBalance[3];
+        m_sSide0[i] = (bL0[i] - bR0[i]) * 0.5f * kBandBalance[0] * m_washBandGain[0];
+        m_sSide1[i] = (bL1[i] - bR1[i]) * 0.5f * kBandBalance[1] * m_washBandGain[1];
+        m_sSide2[i] = (bL2[i] - bR2[i]) * 0.5f * kBandBalance[2] * m_washBandGain[2];
+        m_sSide3[i] = (bL3[i] - bR3[i]) * 0.5f * kBandBalance[3] * m_washBandGain[3];
     }
 
     // --- Feature 3: Per-band ambience factors from spectral variance ---
@@ -1260,14 +1295,25 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
 
     // --- OBJ_SUBBASS: LR4 lowpass (LfeCutoffHz) of the DELAYED ORIGINAL mid ---
-    // On the LFE bed the receiver adds 10 dB, so scale by kSubBedSend; as a
-    // dynamic object it is bass-managed like a speaker and goes out as-is.
-    m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
-    m_spatialLfeLowpass[1].Process(m_sScratch.data(), m_sScratch.data(), frames);
-    if (m_spatialWriter.IsLfeBed()) {
-        for (uint32_t i = 0; i < frames; ++i) m_sScratch[i] *= kSubBedSend;
+    // Level is derived rather than guessed. Bass is mono in nearly every mix,
+    // so with the effect bypassed BOTH front speakers radiate it coherently and
+    // the seat hears their SUM. m_sFullMid is their AVERAGE and still wears the
+    // global trim, so undo both to recover the level the stereo pair delivered.
+    // kBassRedirectGain then sets the bed's send level, and it is unity: the
+    // +10 dB an LFE channel receives in bitstream formats has no decode step
+    // here to apply it, so what we write is what the sub plays. The
+    // multichannel path arrives at the same place by summing its channels
+    // outright, which is what this now matches: it was averaging where that
+    // path sums, and ran 2.9 dB light for it.
+    // Held in m_sSubOut rather than submitted here: the wash has not been built
+    // yet, and its own redirected bass has to join this before the object goes.
+    m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sSubOut.data(), frames);
+    m_spatialLfeLowpass[1].Process(m_sSubOut.data(), m_sSubOut.data(), frames);
+    {
+        const float subGain = SubLevelLinear() * (2.0f / kGlobalOutputGain)
+                            * (m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f);
+        for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] *= subGain;
     }
-    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
 
     // --- OBJ_VOCAL: discrete centre mixed IN ON TOP of the phantom ---
     // The fronts already carry the full centred content as a phantom (residuals
@@ -1282,24 +1328,48 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 
     // --- OBJ_LEFT / OBJ_RIGHT: full delayed L/R, level-restored ---
     // The direct front content carries the midrange core but inherits the
-    // -3.7 dB global trim, leaving it recessed behind the amplified surround
-    // wash. kFrontGain restores the fronts toward unity so the mids sit forward
-    // again. Applied in place AFTER the band split, so the surround/height
-    // feeds (already derived) keep their balance — only the fronts move.
-    constexpr float kFrontGain = 1.54f;  // ~unity: undoes the 0.65 global trim on the fronts
+    // global trim, which would leave the mids recessed behind the surround
+    // wash. kFrontGain lifts them back out. Undoing the trim outright would put
+    // the fronts at the full bypass level and leave the wash nothing to add but
+    // surplus; the square root of kDirectShare holds them a shade under it
+    // instead, so the wash fits inside the budget rather than beyond it.
+    // Applied in place AFTER the band split, so the surround/height feeds
+    // (already derived) keep their balance - only the fronts move.
+    const float kFrontGain = (1.0f / kGlobalOutputGain) * std::sqrt(kDirectShare);
     for (uint32_t i = 0; i < frames; ++i) {
         m_sResidualL[i] *= kFrontGain;
         m_sResidualR[i] *= kFrontGain;
     }
-    // Highpass the fronts at MainsCutoffHz so they stop where the speakers
-    // do. With the overlap off that is LfeCut itself and the sub's lowpass is
-    // complementary — each frequency plays once. With an overlap the fronts
-    // reach below the sub's corner and the shared band is reproduced twice,
-    // summing to a deliberate lift through the low bass.
+    // Hand everything below LfeCut to the sub, whose lowpass is complementary
+    // to this highpass, so the fronts play down to their own limit and no
+    // further and each frequency is reproduced exactly once.
     for (auto& f : m_frontHp[0]) f.Process(m_sResidualL.data(), m_sResidualL.data(), frames);
     for (auto& f : m_frontHp[1]) f.Process(m_sResidualR.data(), m_sResidualR.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
+
+    // Every surround and height object leaves through here. Its untouched power
+    // is accumulated to size the NEXT block's share, and the ratio the previous
+    // block arrived at is applied on the way out. One block of lag on a value
+    // already smoothed over half a second is inaudible.
+    float washRawEnergy = 0.0f;
+    const float washGain = m_washNormGain;
+    std::memset(m_sWashLow.data(), 0, frames * sizeof(float));
+    // Energy is taken BEFORE the highpass on purpose. The redirected bass still
+    // reaches the room, by way of the sub, so it remains the wash's to pay for.
+    // Measuring after the cut would have the normalizer read a quieter wash and
+    // open it up to fill the budget, making the surrounds brighter for exactly
+    // the change meant to settle them.
+    auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx) {
+        for (uint32_t i = 0; i < frames; ++i) {
+            washRawEnergy += buf[i] * buf[i];
+            m_sWashLow[i] += buf[i] * washGain;
+        }
+        m_washHp[idx][0].Process(buf, buf, frames);
+        m_washHp[idx][1].Process(buf, buf, frames);
+        for (uint32_t i = 0; i < frames; ++i) buf[i] *= washGain;
+        m_spatialWriter.SubmitObjectAudio(slot, buf, frames);
+    };
 
     // ================================================================
     // SURROUND SPLIT: each frequency band feeds exactly ONE object pair.
@@ -1411,8 +1481,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         // the diffuser's short delays.
         addLowMidEnv(0, m_sSurrL.data(), kLowMidEnvGain);
         addLowMidEnv(1, m_sSurrR.data(), kLowMidEnvGain);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_LEFT, m_sSurrL.data(), frames);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), frames);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_sSurrL.data(), 0);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), 1);
     }
 
     // --- OBJ_BACK_LEFT/RIGHT: band 2 (presence depth, 2k-8k) ---
@@ -1460,8 +1530,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
         addLowMidEnv(2, m_sSurrL.data(), kLowMidEnvGain);
         addLowMidEnv(3, m_sSurrR.data(), kLowMidEnvGain);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_LEFT, m_sSurrL.data(), frames);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), frames);
+        submitWash(SpatialObjectWriter::OBJ_BACK_LEFT,  m_sSurrL.data(), 2);
+        submitWash(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), 3);
     }
 
     // ================================================================
@@ -1511,8 +1581,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
         addLowMidEnv(4, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
         addLowMidEnv(5, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), frames);
-        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), frames);
+        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), 4);
+        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), 5);
 
         // --- OBJ_TOP_BACK_L/R: only fed when the layout has a physical
         //     rear-height pair. Otherwise submit silence (its content was
@@ -1536,8 +1606,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             }
             addLowMidEnv(6, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
             addLowMidEnv(7, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-            m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), frames);
-            m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), frames);
+            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), 6);
+            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), 7);
         } else {
             const float* silence = m_silenceBuffer.data();
             // Defensive: m_silenceBuffer should be sized in effSetBlockSize,
@@ -1552,6 +1622,66 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
                 m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sScratch.data(), frames);
             }
         }
+    }
+
+    // --- OBJ_SUBBASS: the mid's own bass plus everything the wash gave up ---
+    // Summing the objects first and filtering once is the same arithmetic as
+    // filtering each and summing, and costs two biquads instead of sixteen.
+    // The redirect is deliberately outside SubLevel: that knob is your taste in
+    // subwoofer weight, whereas this is bass management putting back what the
+    // surrounds were never able to voice.
+    m_washLp[0].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
+    m_washLp[1].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
+    {
+        const float redirect = m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f;
+        for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] += m_sWashLow[i] * redirect;
+    }
+    m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sSubOut.data(), frames);
+
+    // --- Per-band share: shape the wash for the next block ---
+    // Each band wants its wash energy in proportion to its own bypass energy,
+    // so the trim goes as sqrt(bypass_b / side_b), with c putting the set on the
+    // right scale. Renormalising afterwards leaves the total side energy where
+    // it was, so this only ever REDISTRIBUTES: the broadband gain below keeps
+    // charge of how loud the wash is, this decides only its colour.
+    {
+        float sumSide = 0.0f, sumBypass = 0.0f;
+        for (int b = 0; b < 4; ++b) { sumSide += bandSideE[b]; sumBypass += bandBypassE[b]; }
+        if (sumSide > 1e-12f && sumBypass > 1e-12f) {
+            const float c = sumSide / sumBypass;
+            float want[4];
+            float shaped = 0.0f;
+            for (int b = 0; b < 4; ++b) {
+                float t = 1.0f;
+                if (bandSideE[b] > 1e-12f) {
+                    t = std::sqrt(c * bandBypassE[b] / bandSideE[b]);
+                    t = std::clamp(t, kWashBandMin, kWashBandMax);
+                }
+                want[b] = t;
+                shaped += t * t * bandSideE[b];
+            }
+            if (shaped > 1e-12f) {
+                const float r = std::sqrt(sumSide / shaped);
+                for (int b = 0; b < 4; ++b) want[b] *= r;
+            }
+            float alpha = static_cast<float>(frames) / (kWashNormTau * m_sampleRate);
+            alpha = std::clamp(alpha, 0.0f, 1.0f);
+            for (int b = 0; b < 4; ++b)
+                m_washBandGain[b] += alpha * (want[b] - m_washBandGain[b]);
+        }
+    }
+
+    // --- Spatial energy budget: size the wash for the next block ---
+    // kWashShare of the bypass power is what the surround and height objects
+    // are allowed between them; washRawEnergy is what they actually wanted.
+    // The ratio of the two, square-rooted into a gain, is the correction. It is
+    // never allowed above unity, so quiet or near-mono passages are left alone.
+    if (washRawEnergy > 1e-12f && bypassPower > 1e-12f) {
+        float want = std::sqrt(kWashShare * bypassPower / washRawEnergy);
+        want = std::clamp(want, kWashNormMin, 1.0f);
+        float alpha = static_cast<float>(frames) / (kWashNormTau * m_sampleRate);
+        alpha = std::clamp(alpha, 0.0f, 1.0f);
+        m_washNormGain += alpha * (want - m_washNormGain);
     }
 
     // Write original L/R to channel outputs as fallback. The caller
@@ -1572,12 +1702,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 //
 // No spectral separation, no delay, no remixing. Genuine multichannel content
 // (games, films) keeps its directional cues intact. The one thing added is
-// bass management: each channel is highpassed at MainsCutoffHz to its object
-// and its content below LfeCut is summed into the LFE bed beside the source's
-// own LFE, so bass from every direction reaches the sub regardless of what the
-// renderer's bass management does with object feeds. Any overlap between the
-// two corners is carried by both and lifts the low bass. Any stereo content that Windows
-// mixed into the front pair stays in OBJ_LEFT/OBJ_RIGHT — the tradeoff:
+// bass management at LfeCut: each channel is highpassed to its object and the
+// remainder is summed into the LFE bed beside the source's own LFE, so bass
+// from every direction reaches the sub regardless of what the renderer's bass
+// management does with object feeds. Any stereo content that Windows mixed
+// into the front pair stays in OBJ_LEFT/OBJ_RIGHT — the tradeoff:
 // stereo apps lose spatial enhancement when a multichannel source is active,
 // but multichannel fidelity is preserved.
 // ============================================================================
