@@ -660,7 +660,16 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
     InputLayout targetLayout;
     if (m_paramMode < 0.125f) {
         InputLayout raw = DetectLayoutFromInputs(inputs, sampleFrames);
-        int hysteresisSamples = static_cast<int>(m_sampleRate * kLayoutHysteresisMs / 1000.0f);
+        // Evidence required before committing. Dropping a multichannel layout
+        // for stereo needs the long grace period; every other transition keeps
+        // the short one.
+        auto holdSamplesFor = [&](InputLayout candidate) {
+            int ms = (candidate == InputLayout::Stereo &&
+                      m_committedLayout != InputLayout::Stereo)
+                         ? kLayoutReleaseHoldMs
+                         : kLayoutHysteresisMs;
+            return static_cast<int>(m_sampleRate * ms / 1000.0f);
+        };
         if (raw == m_committedLayout) {
             // Raw matches the committed layout — reset any pending change.
             m_pendingLayout = raw;
@@ -670,7 +679,7 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
             // samples (time-based, so responsiveness is stable across host
             // block sizes).
             m_pendingSamples += sampleFrames;
-            if (m_pendingSamples >= hysteresisSamples) {
+            if (m_pendingSamples >= holdSamplesFor(m_pendingLayout)) {
                 m_committedLayout = m_pendingLayout;
                 m_pendingSamples = 0;
             }
@@ -723,9 +732,9 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
 
     // 2) Multichannel input → object-promotion path (only when writer ready).
     //    Each channel becomes a positioned Atmos object at its ITU reference
-    //    position. Zero added latency, zero remixing — the Dolby renderer
-    //    handles physical-speaker mapping. Falls through to m_engine if the
-    //    writer is inactive.
+    //    position. Zero added latency, no remixing beyond bass management —
+    //    the Dolby renderer handles physical-speaker mapping. Falls through
+    //    to m_engine if the writer is inactive.
     if ((targetLayout == InputLayout::Surround51 ||
          targetLayout == InputLayout::Surround71 ||
          targetLayout == InputLayout::Passthrough) &&
@@ -824,6 +833,8 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_spatialCorrelation.Initialize(sr);
     m_spatialTransients.Initialize(sr);
     m_lfeCutoffApplied = 0.0f;  // forces a coefficient design on the first block
+    m_mcHpOut.resize(maxFrames);
+    m_mcBedSum.resize(maxFrames);
 
     const auto* presets = GetDecorrelatorPresets();
     for (int i = 0; i < 8; ++i) {
@@ -855,7 +866,7 @@ void MagicSpatialVst::InitSpatialDsp() {
     }
     m_mcDelayPos = 0;
 
-    // --- Feature 1: Early-reflection pre-delay (12 ms) ---
+    // --- Feature 1: Early-reflection pre-delay (kRearPreDelayMs) ---
     m_rearDelayLength = static_cast<int>(sr * static_cast<float>(kRearPreDelayMs) / 1000.0f);
     if (m_rearDelayLength > kRearPreDelayMaxSamples)
         m_rearDelayLength = kRearPreDelayMaxSamples;
@@ -880,21 +891,22 @@ void MagicSpatialVst::InitSpatialDsp() {
         }
         m_sLowMid.resize(maxFrames);
 
-        // Delays are kept short: the decorrelation comes mostly from the
-        // allpass phase dispersion, because anything beyond a few ms here
-        // (stacked on the 8 ms rear pre-delay) reads as a discrete echo of
-        // every kick rather than as room body. Break frequencies spread
-        // across the band so every copy carries a different phase signature.
+        // This feed is a copy of the MID, the dominant content of the mix, so
+        // any audible time offset from the fronts reads as an echo rather than
+        // as room body. Delays stay around a millisecond, purely to break
+        // symmetry between the copies; the decorrelation comes from the
+        // allpass phase dispersion, whose break frequencies are spread across
+        // the band so every copy carries a different phase signature.
         struct LowMidPreset { float delayMs; float breakHz[3]; };
         static constexpr LowMidPreset kPresets[8] = {
-            {3.0f, { 90.0f, 180.0f, 340.0f}},   // SL
-            {5.0f, {110.0f, 230.0f, 400.0f}},   // SR
-            {6.0f, { 80.0f, 200.0f, 360.0f}},   // BL
-            {4.0f, {130.0f, 260.0f, 450.0f}},   // BR
-            {5.5f, {100.0f, 170.0f, 300.0f}},   // TFL
-            {2.5f, {120.0f, 250.0f, 420.0f}},   // TFR
-            {6.5f, { 85.0f, 210.0f, 380.0f}},   // TBL
-            {3.5f, {140.0f, 190.0f, 330.0f}},   // TBR
+            {0.7f, { 90.0f, 180.0f, 340.0f}},   // SL
+            {1.3f, {110.0f, 230.0f, 400.0f}},   // SR
+            {1.6f, { 80.0f, 200.0f, 360.0f}},   // BL
+            {1.0f, {130.0f, 260.0f, 450.0f}},   // BR
+            {1.4f, {100.0f, 170.0f, 300.0f}},   // TFL
+            {0.5f, {120.0f, 250.0f, 420.0f}},   // TFR
+            {1.8f, { 85.0f, 210.0f, 380.0f}},   // TBL
+            {0.9f, {140.0f, 190.0f, 330.0f}},   // TBR
         };
         for (int i = 0; i < 8; ++i) {
             float coeffs[3];
@@ -919,8 +931,23 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_spatialDspInitialized = true;
 }
 
+void MagicSpatialVst::ApplyLfeCutoff() {
+    const float wantHz = LfeCutoffHz();
+    if (wantHz == m_lfeCutoffApplied) return;
+    const auto lp = DesignLowpass(wantHz, m_sampleRate);
+    const auto hp = DesignHighpass(wantHz, m_sampleRate);
+    for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
+    for (auto& pair : m_frontHp) for (auto& f : pair) f.SetCoeffs(hp);
+    for (int ch = 0; ch < kNumInputs; ++ch) {
+        for (auto& f : m_mcHp[ch]) f.SetCoeffs(hp);
+        for (auto& f : m_mcLp[ch]) f.SetCoeffs(lp);
+    }
+    m_lfeCutoffApplied = wantHz;
+}
+
 void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
     InitSpatialDsp();
+    ApplyLfeCutoff();
 
     // Apply user's surround-position override (Side vs Rear). Cheap (2
     // SetObjectPosition calls when the override is active, zero calls when
@@ -1071,16 +1098,13 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
     }
 
-    // Adds a decorrelated copy of the low-mid body to dst, in phase. Ducked on
-    // transients like every other surround feed: an unducked delayed kick
-    // from behind is heard as an echo, not as envelopment.
+    // Adds a decorrelated copy of the low-mid body to dst, in phase. Not
+    // transient-ducked: the feed arrives with the fronts (no pre-delay, no
+    // diffuser), so a kick from behind reinforces rather than echoes.
     auto addLowMidEnv = [&](int decorrIndex, float* dst, float gain) {
         m_lowMidDecorr[decorrIndex].Process(m_sLowMid.data(), m_sScratch.data(), frames);
         const float g = gain * spatialExtGain * ambFactor[1];
-        for (uint32_t i = 0; i < frames; ++i) {
-            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            dst[i] += m_sScratch[i] * g * tDuck;
-        }
+        for (uint32_t i = 0; i < frames; ++i) dst[i] += m_sScratch[i] * g;
     };
 
     // Dynamic L/R position steering: compute energy balance on the delayed mid
@@ -1196,14 +1220,6 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // --- OBJ_SUBBASS: LR4 lowpass (LfeCutoffHz) of the DELAYED ORIGINAL mid ---
     // On the LFE bed the receiver adds 10 dB, so scale by kSubBedSend; as a
     // dynamic object it is bass-managed like a speaker and goes out as-is.
-    {
-        const float wantHz = LfeCutoffHz();
-        if (wantHz != m_lfeCutoffApplied) {
-            const auto lp = DesignLowpass(wantHz, m_sampleRate);
-            for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
-            m_lfeCutoffApplied = wantHz;
-        }
-    }
     m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_spatialLfeLowpass[1].Process(m_sScratch.data(), m_sScratch.data(), frames);
     if (m_spatialWriter.IsLfeBed()) {
@@ -1233,6 +1249,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_sResidualL[i] *= kFrontGain;
         m_sResidualR[i] *= kFrontGain;
     }
+    // Hand everything below LfeCut to the sub (OBJ_SUBBASS carries the
+    // complementary lowpass) so the fronts play down to their own limit and
+    // no further, and the bass is reproduced exactly once.
+    for (auto& f : m_frontHp[0]) f.Process(m_sResidualL.data(), m_sResidualL.data(), frames);
+    for (auto& f : m_frontHp[1]) f.Process(m_sResidualR.data(), m_sResidualR.data(), frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
 
@@ -1326,8 +1347,6 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sSurrL[i] *= spatialExtGain;
             m_sSurrR[i] *= spatialExtGain;
         }
-        addLowMidEnv(0, m_sSurrL.data(), kLowMidEnvGain);
-        addLowMidEnv(1, m_sSurrR.data(), kLowMidEnvGain);
         // Feature 1+4: pre-delay + diffusion on sides
         {
             int len = m_rearDelayLength;
@@ -1343,6 +1362,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[0].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[1].Process(m_sSurrR.data(), frames);
         }
+        // Low-mid body joins AFTER the pre-delay and diffuser: it must arrive
+        // with the fronts, not 8 ms behind them, and it must not be combed by
+        // the diffuser's short delays.
+        addLowMidEnv(0, m_sSurrL.data(), kLowMidEnvGain);
+        addLowMidEnv(1, m_sSurrR.data(), kLowMidEnvGain);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_LEFT, m_sSurrL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), frames);
     }
@@ -1375,8 +1399,6 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sSurrL[i] *= spatialExtGain;
             m_sSurrR[i] *= spatialExtGain;
         }
-        addLowMidEnv(2, m_sSurrL.data(), kLowMidEnvGain);
-        addLowMidEnv(3, m_sSurrR.data(), kLowMidEnvGain);
         // Feature 1+4: pre-delay + diffusion on backs
         {
             int len = m_rearDelayLength;
@@ -1392,6 +1414,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[2].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[3].Process(m_sSurrR.data(), frames);
         }
+        addLowMidEnv(2, m_sSurrL.data(), kLowMidEnvGain);
+        addLowMidEnv(3, m_sSurrR.data(), kLowMidEnvGain);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_LEFT, m_sSurrL.data(), frames);
         m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), frames);
     }
@@ -1496,17 +1520,21 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 }
 
 // ============================================================================
-// Multichannel-to-Object promotion path — zero DSP, zero latency.
+// Multichannel-to-Object promotion path — bass management only, zero latency.
 //
 // For 5.1, 7.1, and 7.1.4 (Passthrough) input, each channel is promoted 1:1
 // to a positioned Atmos object at its ITU reference position. The Dolby
 // renderer then handles mapping onto whatever physical speakers exist.
 //
 // No spectral separation, no delay, no remixing. Genuine multichannel content
-// (games, films) keeps its directional cues intact. Any stereo content that
-// Windows mixed into the front pair stays in OBJ_LEFT/OBJ_RIGHT unaltered —
-// the tradeoff: stereo apps lose spatial enhancement when a multichannel
-// source is active, but multichannel fidelity is preserved.
+// (games, films) keeps its directional cues intact. The one thing added is
+// bass management at LfeCut: each channel is highpassed to its object and the
+// remainder is summed into the LFE bed beside the source's own LFE, so bass
+// from every direction reaches the sub regardless of what the renderer's
+// bass management does with object feeds. Any stereo content that Windows
+// mixed into the front pair stays in OBJ_LEFT/OBJ_RIGHT — the tradeoff:
+// stereo apps lose spatial enhancement when a multichannel source is active,
+// but multichannel fidelity is preserved.
 // ============================================================================
 void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs,
                                                   VstInt32 sampleFrames, InputLayout layout) {
@@ -1524,11 +1552,24 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
     m_spatialWriter.ResetObjectPositionsToReference();
     ApplySurroundPositionOverride();
 
-    // --- Submit each input channel directly to its Atmos object slot ---
+    // --- Submit each input channel to its Atmos object slot, bass-managed ---
+    InitSpatialDsp();
+    ApplyLfeCutoff();
+    std::memset(m_mcBedSum.data(), 0, frames * sizeof(float));
+    const float* lfeInput = silence;
     bool fed[SpatialObjectWriter::OBJ_COUNT] = { false };
-    auto submit = [&](SpatialObjectWriter::ObjectSlot slot, const float* data) {
-        m_spatialWriter.SubmitObjectAudio(slot, data, frames);
+    auto submit = [&](SpatialObjectWriter::ObjectSlot slot, int ch) {
+        if (slot == SpatialObjectWriter::OBJ_SUBBASS) {
+            lfeInput = inputs[ch];   // joined with the redirected bass below
+            return;
+        }
+        m_mcHp[ch][0].Process(inputs[ch], m_mcHpOut.data(), frames);
+        m_mcHp[ch][1].Process(m_mcHpOut.data(), m_mcHpOut.data(), frames);
+        m_spatialWriter.SubmitObjectAudio(slot, m_mcHpOut.data(), frames);
         fed[slot] = true;
+        m_mcLp[ch][0].Process(inputs[ch], m_sScratch.data(), frames);
+        m_mcLp[ch][1].Process(m_sScratch.data(), m_sScratch.data(), frames);
+        for (uint32_t i = 0; i < frames; ++i) m_mcBedSum[i] += m_sScratch[i];
     };
 
     int inputChannelCount = 0;
@@ -1536,47 +1577,57 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
         case InputLayout::Surround51:
             // 6 channels: [0]FL [1]FR [2]C [3]LFE [4]SL [5]SR
             inputChannelCount = 6;
-            submit(SpatialObjectWriter::OBJ_LEFT,       inputs[0]);
-            submit(SpatialObjectWriter::OBJ_RIGHT,      inputs[1]);
-            submit(SpatialObjectWriter::OBJ_VOCAL,      inputs[2]);
-            submit(SpatialObjectWriter::OBJ_SUBBASS,    inputs[3]);
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  inputs[4]);
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, inputs[5]);
+            submit(SpatialObjectWriter::OBJ_LEFT,       0);
+            submit(SpatialObjectWriter::OBJ_RIGHT,      1);
+            submit(SpatialObjectWriter::OBJ_VOCAL,      2);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,    3);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  4);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, 5);
             break;
 
         case InputLayout::Surround71:
             // 8 channels: [0]FL [1]FR [2]C [3]LFE [4]BL [5]BR [6]SL [7]SR
             inputChannelCount = 8;
-            submit(SpatialObjectWriter::OBJ_LEFT,       inputs[0]);
-            submit(SpatialObjectWriter::OBJ_RIGHT,      inputs[1]);
-            submit(SpatialObjectWriter::OBJ_VOCAL,      inputs[2]);
-            submit(SpatialObjectWriter::OBJ_SUBBASS,    inputs[3]);
-            submit(SpatialObjectWriter::OBJ_BACK_LEFT,  inputs[4]);
-            submit(SpatialObjectWriter::OBJ_BACK_RIGHT, inputs[5]);
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  inputs[6]);
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, inputs[7]);
+            submit(SpatialObjectWriter::OBJ_LEFT,       0);
+            submit(SpatialObjectWriter::OBJ_RIGHT,      1);
+            submit(SpatialObjectWriter::OBJ_VOCAL,      2);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,    3);
+            submit(SpatialObjectWriter::OBJ_BACK_LEFT,  4);
+            submit(SpatialObjectWriter::OBJ_BACK_RIGHT, 5);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,  6);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT, 7);
             break;
 
         case InputLayout::Passthrough:
             // 12 channels in AtmosChannel order:
             // [0]FL [1]FR [2]C [3]LFE [4]SL [5]SR [6]BL [7]BR [8]TFL [9]TFR [10]TBL [11]TBR
             inputChannelCount = 12;
-            submit(SpatialObjectWriter::OBJ_LEFT,        inputs[0]);
-            submit(SpatialObjectWriter::OBJ_RIGHT,       inputs[1]);
-            submit(SpatialObjectWriter::OBJ_VOCAL,       inputs[2]);
-            submit(SpatialObjectWriter::OBJ_SUBBASS,     inputs[3]);
-            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,   inputs[4]);
-            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT,  inputs[5]);
-            submit(SpatialObjectWriter::OBJ_BACK_LEFT,   inputs[6]);
-            submit(SpatialObjectWriter::OBJ_BACK_RIGHT,  inputs[7]);
-            submit(SpatialObjectWriter::OBJ_TOP_FRONT_L, inputs[8]);
-            submit(SpatialObjectWriter::OBJ_TOP_FRONT_R, inputs[9]);
-            submit(SpatialObjectWriter::OBJ_TOP_BACK_L,  inputs[10]);
-            submit(SpatialObjectWriter::OBJ_TOP_BACK_R,  inputs[11]);
+            submit(SpatialObjectWriter::OBJ_LEFT,        0);
+            submit(SpatialObjectWriter::OBJ_RIGHT,       1);
+            submit(SpatialObjectWriter::OBJ_VOCAL,       2);
+            submit(SpatialObjectWriter::OBJ_SUBBASS,     3);
+            submit(SpatialObjectWriter::OBJ_SIDE_LEFT,   4);
+            submit(SpatialObjectWriter::OBJ_SIDE_RIGHT,  5);
+            submit(SpatialObjectWriter::OBJ_BACK_LEFT,   6);
+            submit(SpatialObjectWriter::OBJ_BACK_RIGHT,  7);
+            submit(SpatialObjectWriter::OBJ_TOP_FRONT_L, 8);
+            submit(SpatialObjectWriter::OBJ_TOP_FRONT_R, 9);
+            submit(SpatialObjectWriter::OBJ_TOP_BACK_L,  10);
+            submit(SpatialObjectWriter::OBJ_TOP_BACK_R,  11);
             break;
 
         default:
             return;
+    }
+
+    // LFE bed = the source's own LFE plus every channel's redirected bass.
+    {
+        const float redirect = m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            m_sScratch[i] = lfeInput[i] + m_mcBedSum[i] * redirect;
+        }
+        m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sScratch.data(), frames);
+        fed[SpatialObjectWriter::OBJ_SUBBASS] = true;
     }
 
     // Silence for unfed slots.

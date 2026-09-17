@@ -133,6 +133,12 @@ private:
     // consistent detection. Keeps responsiveness stable across host block sizes
     // (20-block constant drifted between 53 ms @ 128-sample and 1.7 s @ 4096).
     static constexpr int kLayoutHysteresisMs = 200;
+    // Releasing a multichannel layout back to stereo is held far longer. A
+    // game that drops its native surround stream for a second between maps
+    // would otherwise drag any concurrent stereo audio (music, a video) into
+    // the upmix path and straight back out again. Acquiring a layout stays on
+    // the short constant above, so surround still engages promptly.
+    static constexpr int kLayoutReleaseHoldMs = 5000;
 
     // In-process spatial object output via ISpatialAudioClient
     SpatialObjectWriter m_spatialWriter;
@@ -146,11 +152,27 @@ private:
     MultibandSplitter m_spatialSplitter;
     StereoCorrelationAnalyzer m_spatialCorrelation;
     TransientDetector m_spatialTransients;
-    // LR4 lowpass feeding OBJ_SUBBASS at LfeCutoffHz(). Re-designed on the
-    // audio thread whenever the parameter moves; m_lfeCutoffApplied records
-    // the frequency the coefficients currently hold.
+    // --- Bass management at LfeCutoffHz(), shared by both spatial paths ---
+    // LR4 lowpass/highpass pairs, complementary so the acoustic sum is flat.
+    // Stereo path: OBJ_SUBBASS carries the lowpassed mid, the fronts are
+    // highpassed. Multichannel path: every non-LFE channel is highpassed to
+    // its object and its lowpassed remainder is summed into the LFE bed, so a
+    // game's rear or height bass reaches the sub even where the renderer's
+    // own bass management does not. All coefficients are re-designed on the
+    // audio thread when the selector moves; m_lfeCutoffApplied records the
+    // frequency currently held.
     BiquadFilter m_spatialLfeLowpass[2];
+    BiquadFilter m_frontHp[2][2];              // [L/R][stage]
+    BiquadFilter m_mcHp[kNumInputs][2];
+    BiquadFilter m_mcLp[kNumInputs][2];
+    std::vector<float> m_mcHpOut;
+    std::vector<float> m_mcBedSum;
     float m_lfeCutoffApplied = 0.0f;
+    void ApplyLfeCutoff();
+    // Redirected bass joins the LFE bed 10 dB down so that, after the
+    // receiver's +10 dB LFE gain, it plays at the level its own speaker would
+    // have given it. Unity when the sub rides a dynamic object instead.
+    static constexpr float kBassRedirectGain = 0.316f;
     // Send level when OBJ_SUBBASS rides the LFE bed. Receivers reproduce LFE
     // 10 dB above a main channel, so 0.316 would put the sub at the same
     // acoustic level the fronts give their own bass; 0.7 lands about +3 dB
@@ -200,7 +222,7 @@ private:
     // --- Feature 1: Early-reflection pre-delay on rear objects ---
     // Ring-buffer delay applied to OBJ_SIDE and OBJ_BACK before submit,
     // creating a perceptual gap between direct front image and surround wash.
-    static constexpr int kRearPreDelayMs = 8;
+    static constexpr int kRearPreDelayMs = 5;
     static constexpr int kRearPreDelayMaxSamples = 1024; // >= ceil(15ms @ 48k)
     std::vector<float> m_rearDelayRing[4]; // [0]=sideL [1]=sideR [2]=backL [3]=backR
     int m_rearDelayLength = 0;
@@ -232,7 +254,7 @@ private:
     static constexpr float kLowMidEnvHighHz = 500.0f;
     // Gain relative to the delayed mid, before spatialExtGain. Surround pairs
     // receive the full amount, heights half.
-    static constexpr float kLowMidEnvGain       = 0.35f;
+    static constexpr float kLowMidEnvGain       = 0.55f;
     static constexpr float kLowMidEnvHeightGain = 0.5f;
 
     // --- Feature 3: Spectral-variance ambience extraction ---
@@ -252,9 +274,10 @@ private:
 
     // Multichannel-to-object promotion path. For 5.1/7.1/Passthrough input,
     // each channel is promoted to a positioned Atmos object at its ITU
-    // reference position, with zero DSP and zero added latency. The Dolby
-    // renderer then maps those objects to whatever physical speakers exist.
-    // Used only when m_spatialWriter.IsActive().
+    // reference position with zero added latency; the only processing is
+    // the bass management above. The Dolby renderer then maps those objects
+    // to whatever physical speakers exist. Used only when
+    // m_spatialWriter.IsActive().
     void ProcessMultichannelObjects(float** inputs, float** outputs,
                                     VstInt32 sampleFrames, InputLayout layout);
 

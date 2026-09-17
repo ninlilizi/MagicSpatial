@@ -33,7 +33,7 @@ private:
     DelayTap m_taps[kNumTaps];
 
     float m_feedback = 0.26f;
-    float m_wetMix   = 0.22f;
+    float m_wetMix   = 0.15f;
     float m_dampCoeff = 0.0f;   // 1-pole LP coefficient (shared across taps)
 };
 
