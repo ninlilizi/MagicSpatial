@@ -162,11 +162,16 @@ private:
     // highpassed. Multichannel path: every non-LFE channel is highpassed to
     // its object and its lowpassed remainder is summed into the LFE bed, so a
     // game's rear or height bass reaches the sub even where the renderer's
-    // own bass management does not. Both sides sit at LfeCutoffHz() and are
-    // complementary, so every frequency is reproduced exactly once and the
-    // acoustic sum is flat. All coefficients are re-designed on the audio
-    // thread when the selector moves; m_lfeCutoffApplied records the frequency
-    // currently held.
+    // own bass management does not. Each pair is complementary, so every
+    // frequency is reproduced exactly once and the acoustic sum is flat.
+    //
+    // The multichannel path uses TWO corners. Its front three hand over at
+    // LfeCutoffHz() like the stereo fronts, while its surrounds and heights -
+    // slots 4 and up in every layout accepted - hand over at the higher
+    // kWashCutHz, because those are smaller drivers crossed higher and the
+    // octave between is excursion they spend without making sound. All
+    // coefficients are re-designed on the audio thread when the selector moves;
+    // m_lfeCutoffApplied records the frequency currently held.
     BiquadFilter m_spatialLfeLowpass[2];
     BiquadFilter m_frontHp[2][2];              // [L/R][stage]
     BiquadFilter m_mcHp[kNumInputs][2];

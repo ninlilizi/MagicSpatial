@@ -986,9 +986,21 @@ void MagicSpatialVst::ApplyLfeCutoff() {
     const auto hp = DesignHighpass(wantHz, m_sampleRate);
     for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
     for (auto& pair : m_frontHp) for (auto& f : pair) f.SetCoeffs(hp);
+
+    // The multichannel path crosses its channels at two corners, not one. In
+    // every layout the plugin accepts, slots 0-2 are the front three, slot 3 is
+    // the source's own LFE (never filtered - it is read straight into the bed),
+    // and everything from 4 up is a surround or a height. Those are the smaller
+    // drivers, crossed higher, so they hand over at kWashCutHz and their extra
+    // octave joins the bed, exactly as the stereo path's wash objects do. Left
+    // at LfeCut they would spend excursion on notes they cannot voice and give
+    // it back as intermodulation, which is heard as harshness rather than bass.
+    const auto washLp = DesignLowpass(kWashCutHz, m_sampleRate);
+    const auto washHp = DesignHighpass(kWashCutHz, m_sampleRate);
     for (int ch = 0; ch < kNumInputs; ++ch) {
-        for (auto& f : m_mcHp[ch]) f.SetCoeffs(hp);
-        for (auto& f : m_mcLp[ch]) f.SetCoeffs(lp);
+        const bool wideDriver = (ch < 4);   // fronts and the LFE slot
+        for (auto& f : m_mcHp[ch]) f.SetCoeffs(wideDriver ? hp : washHp);
+        for (auto& f : m_mcLp[ch]) f.SetCoeffs(wideDriver ? lp : washLp);
     }
     m_lfeCutoffApplied = wantHz;
 }
@@ -1702,10 +1714,12 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 //
 // No spectral separation, no delay, no remixing. Genuine multichannel content
 // (games, films) keeps its directional cues intact. The one thing added is
-// bass management at LfeCut: each channel is highpassed to its object and the
-// remainder is summed into the LFE bed beside the source's own LFE, so bass
-// from every direction reaches the sub regardless of what the renderer's bass
-// management does with object feeds. Any stereo content that Windows mixed
+// bass management: each channel is highpassed to its object and the remainder
+// is summed into the LFE bed beside the source's own LFE, so bass from every
+// direction reaches the sub regardless of what the renderer's bass management
+// does with object feeds. The fronts hand over at LfeCut and the surrounds and
+// heights at the higher kWashCutHz, since those are smaller drivers crossed
+// higher. Any stereo content that Windows mixed
 // into the front pair stays in OBJ_LEFT/OBJ_RIGHT — the tradeoff:
 // stereo apps lose spatial enhancement when a multichannel source is active,
 // but multichannel fidelity is preserved.
@@ -1795,8 +1809,14 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
     }
 
     // LFE bed = the source's own LFE plus every channel's redirected bass.
+    // SubLevel scales the redirected part and ONLY the redirected part. That
+    // bass is ours, moved by our own bass management, so it follows the knob
+    // the way the stereo path's sub does. The source's LFE channel is not ours:
+    // a film's mixer put that level there deliberately, and a taste control has
+    // no business overruling it.
     {
-        const float redirect = m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f;
+        const float redirect = (m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f)
+                             * SubLevelLinear();
         for (uint32_t i = 0; i < frames; ++i) {
             m_sScratch[i] = lfeInput[i] + m_mcBedSum[i] * redirect;
         }
