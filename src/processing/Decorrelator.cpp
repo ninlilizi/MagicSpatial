@@ -20,8 +20,13 @@ const DecorrelatorConfig* GetDecorrelatorPresets() {
 }
 
 float AllpassCoeffForBreakHz(float breakHz, float sampleRate) {
+    // For the section H(z) = (a + z^-1) / (1 + a z^-1) used in Process, the
+    // 90-degree point sits at breakHz when a = (t - 1) / (t + 1). The sign
+    // matters: with it flipped the transition lands at (fs/2 - breakHz), so a
+    // nominal 120 Hz break would turn phase only above 20 kHz and the chain
+    // would pass audio untouched.
     float t = std::tan(3.14159265f * breakHz / sampleRate);
-    return (1.0f - t) / (1.0f + t);
+    return (t - 1.0f) / (t + 1.0f);
 }
 
 Decorrelator::Decorrelator(std::initializer_list<float> coefficients, size_t delaySamples) {

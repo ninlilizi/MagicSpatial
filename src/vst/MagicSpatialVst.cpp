@@ -874,28 +874,44 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_mcHpOut.resize(maxFrames);
     m_mcBedSum.resize(maxFrames);
 
-    const auto* presets = GetDecorrelatorPresets();
-    for (int i = 0; i < 8; ++i) {
-        m_spatialDecorr[i].Initialize(presets[i].coefficients, 3, presets[i].delaySamples);
-    }
-
-    // The top-front pair radiates the side signal in antiphase, and a
+    // Every surround and height pair radiates its blend in antiphase, and a
     // symmetric pair doing so cancels at the seat wherever the two copies are
-    // still in step. The stock presets only move phase above ~2 kHz, so the
-    // ceiling pair nulled its whole low-mid and midrange there (modelled at
-    // -10 to -20 dB below 700 Hz), leaving only presence and hiss. These
-    // breaks hold the two chains close to 180 degrees apart from 150 Hz up,
-    // which with the inversion makes the copies add at the seat across the
-    // band. Delays are equal on purpose: an offset of even three samples walks
-    // the pair back into a null in the treble.
+    // still in step, which is everywhere the head does not shadow: below
+    // roughly 1.5 kHz the ears hear the sum of both speakers. The stock
+    // presets only move phase above ~2 kHz, so with them the sides and backs
+    // nulled the whole mid band at the seat (modelled at -21 dB at 200 Hz,
+    // -13 at 500 and -7 at 1 kHz), leaving presence and hiss. Each pair now
+    // runs a chain with one more section on the left than the right, breaks
+    // interleaved, so the two chains sit close to 180 degrees apart from
+    // below the pair's wash corner upward; with the inversion the copies add
+    // at the seat across the band (+3 dB over an uncorrelated pair, no null
+    // anywhere). Delays are equal within a pair on purpose: an offset of even
+    // three samples walks the pair back into a null in the treble.
+    //
+    // The sides and backs share one design and one delay, since on a 5.1
+    // layout both land on the same rear speakers, and identical chains let
+    // the two blends simply sum there rather than comb. The surround set is
+    // designed for the 120 Hz corner; the height set holds from 150 Hz up
+    // against its 100 Hz corner, which was the design accepted for the
+    // top-front pair.
     {
+        static constexpr float kSurroundBreaksL[6] = {55.0f, 55.0f, 340.0f, 990.0f, 4110.0f, 9340.0f};
+        static constexpr float kSurroundBreaksR[5] = {185.0f, 215.0f, 1150.0f, 3750.0f, 9805.0f};
         static constexpr float kHeightBreaksL[5] = {120.0f, 300.0f, 750.0f, 2340.0f, 4960.0f};
         static constexpr float kHeightBreaksR[4] = {390.0f, 1050.0f, 2900.0f, 6870.0f};
-        float cl[5], cr[4];
-        for (int c = 0; c < 5; ++c) cl[c] = AllpassCoeffForBreakHz(kHeightBreaksL[c], sr);
-        for (int c = 0; c < 4; ++c) cr[c] = AllpassCoeffForBreakHz(kHeightBreaksR[c], sr);
-        m_spatialDecorr[4].Initialize(cl, 5, 23);
-        m_spatialDecorr[5].Initialize(cr, 4, 23);
+        float sl[6], srr[5], hl[5], hr[4];
+        for (int c = 0; c < 6; ++c) sl[c]  = AllpassCoeffForBreakHz(kSurroundBreaksL[c], sr);
+        for (int c = 0; c < 5; ++c) srr[c] = AllpassCoeffForBreakHz(kSurroundBreaksR[c], sr);
+        for (int c = 0; c < 5; ++c) hl[c]  = AllpassCoeffForBreakHz(kHeightBreaksL[c], sr);
+        for (int c = 0; c < 4; ++c) hr[c]  = AllpassCoeffForBreakHz(kHeightBreaksR[c], sr);
+        m_spatialDecorr[0].Initialize(sl, 6, 7);    // SL
+        m_spatialDecorr[1].Initialize(srr, 5, 7);   // SR
+        m_spatialDecorr[2].Initialize(sl, 6, 7);    // BL
+        m_spatialDecorr[3].Initialize(srr, 5, 7);   // BR
+        m_spatialDecorr[4].Initialize(hl, 5, 23);   // TFL
+        m_spatialDecorr[5].Initialize(hr, 4, 23);   // TFR
+        m_spatialDecorr[6].Initialize(sl, 6, 23);   // TBL
+        m_spatialDecorr[7].Initialize(srr, 5, 23);  // TBR
     }
 
     // Pre-allocate all scratch buffers (#1: no heap allocation on audio thread)
@@ -962,26 +978,50 @@ void MagicSpatialVst::InitSpatialDsp() {
         // This feed is a copy of the MID, the dominant content of the mix, so
         // any audible time offset from the fronts reads as an echo rather than
         // as room body. Delays stay around a millisecond, purely to break
-        // symmetry between the copies; the decorrelation comes from the
-        // allpass phase dispersion, whose break frequencies are spread across
-        // the band so every copy carries a different phase signature.
-        struct LowMidPreset { float delayMs; float breakHz[3]; };
-        static constexpr LowMidPreset kPresets[8] = {
-            {0.7f, { 90.0f, 180.0f, 340.0f}},   // SL
-            {1.3f, {110.0f, 230.0f, 400.0f}},   // SR
-            {1.6f, { 80.0f, 200.0f, 360.0f}},   // BL
-            {1.0f, {130.0f, 260.0f, 450.0f}},   // BR
-            {1.4f, {100.0f, 170.0f, 300.0f}},   // TFL
-            {0.5f, {120.0f, 250.0f, 420.0f}},   // TFR
-            {1.8f, { 85.0f, 210.0f, 380.0f}},   // TBL
-            {0.9f, {140.0f, 190.0f, 330.0f}},   // TBR
+        // symmetry between the copies. There is no allpass stage: these
+        // copies were voiced and accepted as plain delays (the allpass
+        // sections they once carried were transparent, see
+        // AllpassCoeffForBreakHz), and at these wavelengths coherent copies
+        // are what give the body its weight at the seat.
+        static constexpr float kLowMidDelayMs[8] = {
+            0.7f, 1.3f, 1.6f, 1.0f, 1.4f, 0.5f, 1.8f, 0.9f
+        };
+        for (int i = 0; i < 8; ++i) {
+            size_t delay = static_cast<size_t>(kLowMidDelayMs[i] * sr / 1000.0f + 0.5f);
+            m_lowMidDecorr[i].Initialize(nullptr, 0, delay);
+        }
+    }
+
+    // --- Feature 6: Transient-keyed snap feed ---
+    {
+        const auto hp = DesignHighpass(kLowMidEnvHighHz, sr);
+        const auto lp = DesignLowpass(kSnapHighHz, sr);
+        for (int i = 0; i < 2; ++i) {
+            m_snapHp[i].SetCoeffs(hp);
+            m_snapLp[i].SetCoeffs(lp);
+        }
+        m_sSnap.resize(maxFrames);
+
+        // Breaks inside the band and delays under 1.2 ms. Chosen by search so
+        // that the copies reaching a 5.1.2 or 5.1.4 seat never sum below
+        // their power sum anywhere from 300 Hz to 6 kHz.
+        struct SnapPreset { float delayMs; float breakHz[3]; };
+        static constexpr SnapPreset kPresets[8] = {
+            {1.1f, {2420.0f, 2665.0f, 3347.0f}},   // SL
+            {1.0f, { 609.0f, 1351.0f, 1369.0f}},   // SR
+            {1.0f, {1476.0f, 2536.0f, 3027.0f}},   // BL
+            {1.0f, { 585.0f, 1548.0f, 2167.0f}},   // BR
+            {0.6f, { 594.0f,  924.0f, 2854.0f}},   // TFL
+            {1.1f, {1177.0f, 2557.0f, 3156.0f}},   // TFR
+            {0.5f, { 551.0f,  790.0f, 2467.0f}},   // TBL
+            {1.1f, { 807.0f,  892.0f, 2953.0f}},   // TBR
         };
         for (int i = 0; i < 8; ++i) {
             float coeffs[3];
             for (int c = 0; c < 3; ++c)
                 coeffs[c] = AllpassCoeffForBreakHz(kPresets[i].breakHz[c], sr);
             size_t delay = static_cast<size_t>(kPresets[i].delayMs * sr / 1000.0f + 0.5f);
-            m_lowMidDecorr[i].Initialize(coeffs, 3, delay);
+            m_snapDecorr[i].Initialize(coeffs, 3, delay);
         }
     }
 
@@ -1141,6 +1181,19 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // Its bottom is set later by each wash object's own corner.
     m_lowMidLp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_lowMidLp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
+
+    // --- Feature 6: the hits in the mid from kLowMidEnvHighHz to kSnapHighHz ---
+    // Keyed by the square of the transient envelope: a hit opens it fully for
+    // its first few milliseconds, while the small ratio a dense sustained
+    // passage leaves on the detector is squared down to nothing.
+    m_snapHp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
+    m_snapHp[1].Process(m_sScratch.data(), m_sSnap.data(), frames);
+    m_snapLp[0].Process(m_sSnap.data(), m_sScratch.data(), frames);
+    m_snapLp[1].Process(m_sScratch.data(), m_sSnap.data(), frames);
+    for (uint32_t i = 0; i < frames; ++i) {
+        const float t = m_sTransients[i];
+        m_sSnap[i] *= t * t;
+    }
 
     // --- Feature 2: Correlation-adaptive spatial extension gain ---
     // Average correlation across bands (weighted by perceptual importance) to
@@ -1401,14 +1454,20 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // be combed by the diffuser's short delays) and is not transient-ducked
     // (a kick from behind reinforces rather than echoes). The corner then
     // sets its bottom, and it is counted in the budget but kept off the sub.
+    //
+    // The snap feed joins at the same point and for the same reasons; it is
+    // scaled by the same height factor as the low-mid feed so the two meet at
+    // kLowMidEnvHighHz at matching weight on every object.
     auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx,
-                          float lowMidGain) {
+                          float lowMidGain, float snapGain) {
         float* low = (idx >= 4) ? m_sWashLowHeight.data() : m_sWashLow.data();
         for (uint32_t i = 0; i < frames; ++i) low[i] += buf[i] * washGain;
         m_lowMidDecorr[idx].Process(m_sLowMid.data(), m_sScratch.data(), frames);
         const float g = lowMidGain * spatialExtGain * ambFactor[1];
+        for (uint32_t i = 0; i < frames; ++i) buf[i] += m_sScratch[i] * g;
+        m_snapDecorr[idx].Process(m_sSnap.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
-            buf[i] += m_sScratch[i] * g;
+            buf[i] += m_sScratch[i] * snapGain;
             washRawEnergy += buf[i] * buf[i];
         }
         m_washHp[idx][0].Process(buf, buf, frames);
@@ -1424,84 +1483,44 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // ================================================================
 
     // Layout-aware: when no physical top-back exists (everything other than
-    // 5.1.4 / 7.1.4) the top-back side blend gets folded TWO ways — into the
-    // top-front feed (already there) AND into the surround feed below at 50%
-    // through decorrelators [6]/[7]. The latter reinforces the
-    // "behind-and-above" perceptual cue: the user's rear physical pair carries
-    // a phase-scrambled echo of what would have come from the missing rear
-    // ceiling speakers. Decorrelators [6]/[7] are otherwise unused in *.1.2
-    // layouts (they normally drive OBJ_TOP_BACK), so we appropriate them here.
+    // 5.1.4 / 7.1.4) the top-back side blend gets folded TWO ways: into the
+    // top-front feed (already there) AND into the surround blend below. The
+    // latter reinforces the "behind-and-above" perceptual cue: the user's
+    // rear physical pair carries what would have come from the missing rear
+    // ceiling speakers.
     SpeakerLayout sl_h = SpeakerLayoutFromParam();
     const bool hasTopBack = (sl_h == SpeakerLayout::Layout_514 ||
                              sl_h == SpeakerLayout::Layout_714);
 
     // --- OBJ_SIDE_LEFT/RIGHT: full-bandwidth side signal ---
-    // Decorrelated band 1 + direct band 3 form the spectral character
-    // (room warmth + treble shimmer). Bands 0 and 2 are added direct at
-    // modest gains so the object carries all four bands and Dolby's bass
-    // management can decide where low frequencies go (LFE vs. mains).
+    // Band 1 + band 3 form the spectral character (room warmth + treble
+    // shimmer); bands 0 and 2 fill at modest gains so the object carries all
+    // four. The whole blend is built first and then sent through the paired
+    // chains [0]/[1] in antiphase, so every band, not only band 1, arrives at
+    // the seat adding rather than cancelling. The duck applies to the terms
+    // it always did: band 1 and the top-back fold, which carry the plucks and
+    // cracks that would otherwise echo out of the pre-delay.
     {
-        std::memset(m_sSurrL.data(), 0, frames * sizeof(float));
-        std::memset(m_sSurrR.data(), 0, frames * sizeof(float));
-
-        // Band 1 low-mid side through decorrelators [0, 1]
-        {
-            for (uint32_t i = 0; i < frames; ++i) {
-                m_sAmbL[i] =  m_sSide1[i] * sw[1];
-                m_sAmbR[i] = -m_sSide1[i] * sw[1];
-            }
-            m_spatialDecorr[0].Process(m_sAmbL.data(), m_sScratch.data(), frames);
-            for (uint32_t i = 0; i < frames; ++i) {
-                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrL[i] += m_sScratch[i] * 3.50f * ambFactor[1] * tDuck;
-            }
-            m_spatialDecorr[1].Process(m_sAmbR.data(), m_sScratch.data(), frames);
-            for (uint32_t i = 0; i < frames; ++i) {
-                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrR[i] += m_sScratch[i] * 3.50f * ambFactor[1] * tDuck;
-            }
-        }
-
-        // Band 3 treble side (direct, no decorrelator — inverted for width)
         for (uint32_t i = 0; i < frames; ++i) {
-            m_sSurrL[i] += m_sSide3[i] * 3.75f * ambFactor[3] * sw[3];
-            m_sSurrR[i] -= m_sSide3[i] * 3.75f * ambFactor[3] * sw[3];
+            const float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            float blend = m_sSide1[i] * 3.50f * ambFactor[1] * sw[1] * tDuck
+                        + m_sSide3[i] * 3.75f * ambFactor[3] * sw[3]
+                        + m_sSide0[i] * 1.50f * ambFactor[0]
+                        + m_sSide2[i] * 1.50f * ambFactor[2];
+            // Top-back fold (only when no physical top-back pair): the rear
+            // physical pair receives every band of the would-be top-back
+            // content. It rides the same chains as the rest of the blend;
+            // the top-front fold has its own chain design, so the two
+            // remain distinct cues.
+            if (!hasTopBack) {
+                blend += (m_sSide0[i] * 1.50f + m_sSide1[i] * 1.50f
+                        + m_sSide2[i] * 2.50f + m_sSide3[i] * 3.50f) * tDuck;
+            }
+            m_sAmbL[i] =  blend;
+            m_sAmbR[i] = -blend;
         }
-
-        // Bands 0 + 2 fill (direct, modest gain + ambience boost)
-        for (uint32_t i = 0; i < frames; ++i) {
-            float fill = m_sSide0[i] * 1.50f * ambFactor[0] + m_sSide2[i] * 1.50f * ambFactor[2];
-            m_sSurrL[i] += fill;
-            m_sSurrR[i] -= fill;
-        }
-
-        // Top-back fold into surround (only when no physical top-back pair).
-        // 50% of the would-be top-back blend (m_sSide2 * 5.0 + m_sSide3 * 7.0)
-        // through decorrelators [6]/[7] keeps phase distinct from the
-        // top-front fold (decorrelators [4]/[5]) so the renderer perceives
-        // them as spatially separate cues rather than comb-filtering siblings.
-        if (!hasTopBack) {
-            // Full-bandwidth fold so the rear physical pair receives every
-            // band of the would-be top-back content.
-            for (uint32_t i = 0; i < frames; ++i) {
-                m_sAmbL[i] = m_sSide0[i] * 1.50f + m_sSide1[i] * 1.50f
-                           + m_sSide2[i] * 2.50f + m_sSide3[i] * 3.50f;
-            }
-            m_spatialDecorr[6].Process(m_sAmbL.data(), m_sScratch.data(), frames);
-            for (uint32_t i = 0; i < frames; ++i) {
-                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrL[i] += m_sScratch[i] * tDuck;
-            }
-            for (uint32_t i = 0; i < frames; ++i) {
-                m_sAmbR[i] = -(m_sSide0[i] * 1.50f + m_sSide1[i] * 1.50f
-                             + m_sSide2[i] * 2.50f + m_sSide3[i] * 3.50f);
-            }
-            m_spatialDecorr[7].Process(m_sAmbR.data(), m_sScratch.data(), frames);
-            for (uint32_t i = 0; i < frames; ++i) {
-                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sSurrR[i] += m_sScratch[i] * tDuck;
-            }
-        }
+        m_spatialDecorr[0].Process(m_sAmbL.data(), m_sSurrL.data(), frames);
+        m_spatialDecorr[1].Process(m_sAmbR.data(), m_sSurrR.data(), frames);
 
         for (uint32_t i = 0; i < frames; ++i) {
             m_sSurrL[i] *= spatialExtGain;
@@ -1522,33 +1541,26 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[0].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[1].Process(m_sSurrR.data(), frames);
         }
-        submitWash(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_sSurrL.data(), 0, kLowMidEnvGain);
-        submitWash(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), 1, kLowMidEnvGain);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_sSurrL.data(), 0, kLowMidEnvGain, kSnapGain);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), 1, kLowMidEnvGain, kSnapGain);
     }
 
     // --- OBJ_BACK_LEFT/RIGHT: band 2 (presence depth, 2k-8k) ---
-    // Reuses m_sSurrL/R (safe — SubmitObjectAudio already copied the side data).
+    // Reuses m_sSurrL/R (safe: SubmitObjectAudio already copied the side data).
+    // Bands 0 + 1 + 3 fill at modest gain, same full-bandwidth principle as
+    // the sides. The blend takes the same sign convention and the same chains
+    // as the sides, so on a layout where both pairs land on one rear pair of
+    // speakers the two blends sum cleanly instead of combing.
     {
-        m_spatialDecorr[2].Process(m_sSide2.data(), m_sScratch.data(), frames);
         for (uint32_t i = 0; i < frames; ++i) {
-            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrL[i] = m_sScratch[i] * 5.00f * sw[2] * tDuck;
+            const float tDuck = 1.0f - m_sTransients[i] * 0.5f;
+            const float blend = m_sSide2[i] * 5.00f * sw[2] * tDuck
+                              + m_sSide0[i] * 1.50f + m_sSide1[i] * 1.25f + m_sSide3[i] * 1.25f;
+            m_sAmbL[i] =  blend;
+            m_sAmbR[i] = -blend;
         }
-        m_spatialDecorr[3].Process(m_sSide2.data(), m_sScratch.data(), frames);
-        for (uint32_t i = 0; i < frames; ++i) {
-            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sSurrR[i] = m_sScratch[i] * 5.00f * sw[2] * tDuck;
-        }
-
-        // Bands 0 + 1 + 3 fill (direct, modest gain) — same full-bandwidth
-        // principle as sides: every object carries every band so Dolby's
-        // bass management has the freedom to crossover per the user's setup.
-        // Inversion across L/R keeps the back-pair phase-distinct from sides.
-        for (uint32_t i = 0; i < frames; ++i) {
-            float fill = m_sSide0[i] * 1.50f + m_sSide1[i] * 1.25f + m_sSide3[i] * 1.25f;
-            m_sSurrL[i] -= fill;
-            m_sSurrR[i] += fill;
-        }
+        m_spatialDecorr[2].Process(m_sAmbL.data(), m_sSurrL.data(), frames);
+        m_spatialDecorr[3].Process(m_sAmbR.data(), m_sSurrR.data(), frames);
 
         for (uint32_t i = 0; i < frames; ++i) {
             m_sSurrL[i] *= spatialExtGain;
@@ -1569,8 +1581,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[2].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[3].Process(m_sSurrR.data(), frames);
         }
-        submitWash(SpatialObjectWriter::OBJ_BACK_LEFT,  m_sSurrL.data(), 2, kLowMidEnvGain);
-        submitWash(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), 3, kLowMidEnvGain);
+        submitWash(SpatialObjectWriter::OBJ_BACK_LEFT,  m_sSurrL.data(), 2, kLowMidEnvGain, kSnapGain);
+        submitWash(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), 3, kLowMidEnvGain, kSnapGain);
     }
 
     // ================================================================
@@ -1622,9 +1634,9 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sHeightR[i] *= spatialExtGain;
         }
         submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), 4,
-                   kLowMidEnvGain * kLowMidEnvHeightGain);
+                   kLowMidEnvGain * kLowMidEnvHeightGain, kSnapGain * kLowMidEnvHeightGain);
         submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), 5,
-                   kLowMidEnvGain * kLowMidEnvHeightGain);
+                   kLowMidEnvGain * kLowMidEnvHeightGain, kSnapGain * kLowMidEnvHeightGain);
 
         // --- OBJ_TOP_BACK_L/R: only fed when the layout has a physical
         //     rear-height pair. Otherwise submit silence (its content was
@@ -1646,9 +1658,9 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
                 m_sHeightR[i] *= spatialExtGain;
             }
             submitWash(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), 6,
-                       kLowMidEnvGain * kLowMidEnvHeightGain);
+                       kLowMidEnvGain * kLowMidEnvHeightGain, kSnapGain * kLowMidEnvHeightGain);
             submitWash(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), 7,
-                       kLowMidEnvGain * kLowMidEnvHeightGain);
+                       kLowMidEnvGain * kLowMidEnvHeightGain, kSnapGain * kLowMidEnvHeightGain);
         } else {
             const float* silence = m_silenceBuffer.data();
             // Defensive: m_silenceBuffer should be sized in effSetBlockSize,

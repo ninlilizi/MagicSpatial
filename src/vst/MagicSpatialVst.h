@@ -209,6 +209,10 @@ private:
     int   SubLevelIndex() const;
     float SubLevelDb() const { return kSubLevelChoicesDb[SubLevelIndex()]; }
     float SubLevelLinear() const { return std::pow(10.0f, SubLevelDb() / 20.0f); }
+    // [0]SL [1]SR [2]BL [3]BR [4]TFL [5]TFR [6]TBL [7]TBR. Every pair is fed
+    // its blend in antiphase and runs allpass chains held ~180 degrees apart
+    // from below its wash corner upward, so the two copies add at the seat
+    // instead of cancelling wherever the head sums them.
     Decorrelator m_spatialDecorr[8];
     bool m_spatialDspInitialized = false;
 
@@ -272,10 +276,10 @@ private:
     // Bass and low-mids are mono in nearly every mix, so the L-R side signal
     // that drives every surround/height object is empty below ~300 Hz and the
     // wash carries presence only. This feed takes the body of the MID signal
-    // below kLowMidEnvHighHz, decorrelates each copy with short delays and
-    // low-break allpasses (the stock presets are transparent at these
-    // wavelengths), and adds it IN PHASE to the sides, backs and heights.
-    // In-phase copies never null at the seat.
+    // below kLowMidEnvHighHz, offsets each copy by a delay of a millisecond
+    // or so, and adds it IN PHASE to the sides, backs and heights. In-phase
+    // copies never null at the seat, and at these wavelengths the delays are
+    // a small fraction of a period, so the copies sum coherently there.
     //
     // It has no highpass of its own. Each copy joins its object after the
     // bass redirect is taken and before that object's wash corner, so the
@@ -297,6 +301,32 @@ private:
     // receive the full amount, heights half.
     static constexpr float kLowMidEnvGain       = 0.55f;
     static constexpr float kLowMidEnvHeightGain = 0.5f;
+
+    // --- Feature 6: Transient-keyed snap feed ---
+    // The low-mid feed stops at kLowMidEnvHighHz, and above it the wash is
+    // side signal only: pre-delayed, diffused and transient-ducked so the
+    // surrounds do not echo every hit. That keeps the room polite, and it
+    // also keeps it out of the beat. This feed takes the mid from
+    // kLowMidEnvHighHz up to kSnapHighHz (LR4 at both ends, so it butts
+    // against the low-mid feed with no seam), multiplies it by the square of
+    // the transient envelope so only the first few milliseconds of each hit
+    // pass, and adds a decorrelated copy IN PHASE to every wash object on
+    // the low-mid feed's pattern: after the pre-delay and diffuser, so it
+    // lands with the fronts. Sustained content stays out, which is what kept
+    // the same region from turning to mud when the low-mid feed reached it.
+    // Its decorrelators break inside the band so the copies scatter in phase
+    // rather than comb against one another. It is keyed on the hit itself,
+    // not on stereo width, so it works on narrow and mono material too, and
+    // for that reason it is not scaled by spatialExtGain. Counted in the
+    // wash budget like everything else that leaves through submitWash.
+    BiquadFilter m_snapHp[2];      // LR4 highpass at kLowMidEnvHighHz
+    BiquadFilter m_snapLp[2];      // LR4 lowpass at kSnapHighHz
+    Decorrelator m_snapDecorr[8];  // same slot order as m_lowMidDecorr
+    std::vector<float> m_sSnap;
+    static constexpr float kSnapHighHz = 4000.0f;
+    // Gain relative to the delayed mid at the peak of a hit. Surround pairs
+    // receive the full amount, heights kLowMidEnvHeightGain of it.
+    static constexpr float kSnapGain = 0.5f;
 
     // --- Wash bass management ---
     // The surround and height speakers are smaller than the fronts and crossed
