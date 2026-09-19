@@ -879,6 +879,25 @@ void MagicSpatialVst::InitSpatialDsp() {
         m_spatialDecorr[i].Initialize(presets[i].coefficients, 3, presets[i].delaySamples);
     }
 
+    // The top-front pair radiates the side signal in antiphase, and a
+    // symmetric pair doing so cancels at the seat wherever the two copies are
+    // still in step. The stock presets only move phase above ~2 kHz, so the
+    // ceiling pair nulled its whole low-mid and midrange there (modelled at
+    // -10 to -20 dB below 700 Hz), leaving only presence and hiss. These
+    // breaks hold the two chains close to 180 degrees apart from 150 Hz up,
+    // which with the inversion makes the copies add at the seat across the
+    // band. Delays are equal on purpose: an offset of even three samples walks
+    // the pair back into a null in the treble.
+    {
+        static constexpr float kHeightBreaksL[5] = {120.0f, 300.0f, 750.0f, 2340.0f, 4960.0f};
+        static constexpr float kHeightBreaksR[4] = {390.0f, 1050.0f, 2900.0f, 6870.0f};
+        float cl[5], cr[4];
+        for (int c = 0; c < 5; ++c) cl[c] = AllpassCoeffForBreakHz(kHeightBreaksL[c], sr);
+        for (int c = 0; c < 4; ++c) cr[c] = AllpassCoeffForBreakHz(kHeightBreaksR[c], sr);
+        m_spatialDecorr[4].Initialize(cl, 5, 23);
+        m_spatialDecorr[5].Initialize(cr, 4, 23);
+    }
+
     // Pre-allocate all scratch buffers (#1: no heap allocation on audio thread)
     for (int b = 0; b < 4; ++b) {
         m_sBandL[b].resize(maxFrames);
@@ -894,15 +913,20 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_sDelayedL.resize(maxFrames); m_sDelayedR.resize(maxFrames);
     m_sCenter.resize(maxFrames);
     m_sResidualL.resize(maxFrames); m_sResidualR.resize(maxFrames);
-    m_sWashLow.resize(maxFrames); m_sSubOut.resize(maxFrames);
+    m_sWashLow.resize(maxFrames); m_sWashLowHeight.resize(maxFrames);
+    m_sSubOut.resize(maxFrames);
 
-    // Wash bass management. Fixed at kWashCutHz: it tracks the surround and
-    // height speakers' own crossover, not the fronts' LfeCut selector.
+    // Wash bass management. Fixed corners that track the surround and height
+    // speakers' own crossovers, not the fronts' LfeCut selector.
     {
-        const auto washHp = DesignHighpass(kWashCutHz, sr);
-        const auto washLp = DesignLowpass(kWashCutHz, sr);
-        for (auto& obj : m_washHp) for (auto& f : obj) f.SetCoeffs(washHp);
+        const auto washHp   = DesignHighpass(kWashCutHz, sr);
+        const auto washLp   = DesignLowpass(kWashCutHz, sr);
+        const auto heightHp = DesignHighpass(kHeightCutHz, sr);
+        const auto heightLp = DesignLowpass(kHeightCutHz, sr);
+        for (int obj = 0; obj < 8; ++obj)
+            for (auto& f : m_washHp[obj]) f.SetCoeffs(obj >= 4 ? heightHp : washHp);
         for (auto& f : m_washLp) f.SetCoeffs(washLp);
+        for (auto& f : m_washLpHeight) f.SetCoeffs(heightLp);
     }
 
     // Delay rings + scratch for stereo-aware multichannel extraction.
@@ -987,20 +1011,24 @@ void MagicSpatialVst::ApplyLfeCutoff() {
     for (auto& f : m_spatialLfeLowpass) f.SetCoeffs(lp);
     for (auto& pair : m_frontHp) for (auto& f : pair) f.SetCoeffs(hp);
 
-    // The multichannel path crosses its channels at two corners, not one. In
+    // The multichannel path crosses its channels at three corners, not one. In
     // every layout the plugin accepts, slots 0-2 are the front three, slot 3 is
     // the source's own LFE (never filtered - it is read straight into the bed),
-    // and everything from 4 up is a surround or a height. Those are the smaller
-    // drivers, crossed higher, so they hand over at kWashCutHz and their extra
-    // octave joins the bed, exactly as the stereo path's wash objects do. Left
-    // at LfeCut they would spend excursion on notes they cannot voice and give
-    // it back as intermodulation, which is heard as harshness rather than bass.
-    const auto washLp = DesignLowpass(kWashCutHz, m_sampleRate);
-    const auto washHp = DesignHighpass(kWashCutHz, m_sampleRate);
+    // slots 4-7 are surrounds and slots 8-11 are heights. Those are the smaller
+    // drivers, crossed higher, so they hand over at kWashCutHz and kHeightCutHz
+    // and the remainder joins the bed, exactly as the stereo path's wash
+    // objects do. Left at LfeCut they would spend excursion on notes they
+    // cannot voice and give it back as intermodulation, which is heard as
+    // harshness rather than bass.
+    const auto washLp   = DesignLowpass(kWashCutHz, m_sampleRate);
+    const auto washHp   = DesignHighpass(kWashCutHz, m_sampleRate);
+    const auto heightLp = DesignLowpass(kHeightCutHz, m_sampleRate);
+    const auto heightHp = DesignHighpass(kHeightCutHz, m_sampleRate);
     for (int ch = 0; ch < kNumInputs; ++ch) {
         const bool wideDriver = (ch < 4);   // fronts and the LFE slot
-        for (auto& f : m_mcHp[ch]) f.SetCoeffs(wideDriver ? hp : washHp);
-        for (auto& f : m_mcLp[ch]) f.SetCoeffs(wideDriver ? lp : washLp);
+        const bool height = (ch >= 8);
+        for (auto& f : m_mcHp[ch]) f.SetCoeffs(wideDriver ? hp : height ? heightHp : washHp);
+        for (auto& f : m_mcLp[ch]) f.SetCoeffs(wideDriver ? lp : height ? heightLp : washLp);
     }
     m_lfeCutoffApplied = wantHz;
 }
@@ -1102,10 +1130,16 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
 
     // --- Transient detection ---
+    // The detector hears the mid above 200 Hz only. On the full mid a kick's
+    // thump was the largest thing in the signal, so every beat fired the duck
+    // and the wash dipped in time with the sub. The duck exists to keep snare
+    // cracks and plucks from echoing out of the pre-delayed surrounds, and
+    // those live in the upper bands, which the residual split already holds.
     for (uint32_t i = 0; i < frames; ++i) {
         m_sFullMid[i] = (L[i] + R[i]) * 0.5f;
+        m_sScratch[i] = (bL1[i] + bR1[i] + bL2[i] + bR2[i] + bL3[i] + bR3[i]) * 0.5f;
     }
-    m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
+    m_spatialTransients.Process(m_sScratch.data(), m_sTransients.data(), frames);
 
     // --- Feature 5: 100-250 Hz body of the mid (LR4 bandpass) ---
     m_lowMidHp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
@@ -1267,7 +1301,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         m_spatialWriter.SetObjectPosition(SpatialObjectWriter::OBJ_VOCAL, 0.0f, vy, -0.7f);
     }
 
-    // Dynamic height elevation via the Pratt effect: bright residual content
+    // Dynamic height elevation via the Pratt effect (ignored by the writer on
+    // endpoints that carry the heights as static beds): bright residual content
     // floats all four overhead objects upward; dark/bass-heavy content settles
     // them back. Brightness is computed from residual band energies (band 3 /
     // total), smoothed at block rate, and mapped to an elevation angle.
@@ -1367,15 +1402,17 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     float washRawEnergy = 0.0f;
     const float washGain = m_washNormGain;
     std::memset(m_sWashLow.data(), 0, frames * sizeof(float));
+    std::memset(m_sWashLowHeight.data(), 0, frames * sizeof(float));
     // Energy is taken BEFORE the highpass on purpose. The redirected bass still
     // reaches the room, by way of the sub, so it remains the wash's to pay for.
     // Measuring after the cut would have the normalizer read a quieter wash and
     // open it up to fill the budget, making the surrounds brighter for exactly
     // the change meant to settle them.
     auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx) {
+        float* low = (idx >= 4) ? m_sWashLowHeight.data() : m_sWashLow.data();
         for (uint32_t i = 0; i < frames; ++i) {
             washRawEnergy += buf[i] * buf[i];
-            m_sWashLow[i] += buf[i] * washGain;
+            low[i] += buf[i] * washGain;
         }
         m_washHp[idx][0].Process(buf, buf, frames);
         m_washHp[idx][1].Process(buf, buf, frames);
@@ -1581,9 +1618,12 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             if (!hasTopBack) {
                 frontBlend += m_sSide2[i] * 2.0f + m_sSide3[i] * 1.5f;
             }
-            float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-            m_sAmbL[i] =  frontBlend * tDuck;
-            m_sAmbR[i] = -frontBlend * tDuck;
+            // Not transient-ducked: the heights have no pre-delay and no
+            // diffuser, so a transient from above arrives with the fronts and
+            // reinforces rather than echoes. Ducking them whole made the
+            // ceiling drop out on every beat.
+            m_sAmbL[i] =  frontBlend;
+            m_sAmbR[i] = -frontBlend;
         }
         m_spatialDecorr[4].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
         m_spatialDecorr[5].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
@@ -1606,9 +1646,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             for (uint32_t i = 0; i < frames; ++i) {
                 float backBlend = m_sSide0[i] * 2.0f + m_sSide1[i] * 2.0f
                                 + m_sSide2[i] * 3.5f + m_sSide3[i] * 5.0f;
-                float tDuck = 1.0f - m_sTransients[i] * 0.5f;
-                m_sAmbL[i] =  backBlend * tDuck;
-                m_sAmbR[i] = -backBlend * tDuck;
+                m_sAmbL[i] =  backBlend;
+                m_sAmbR[i] = -backBlend;
             }
             m_spatialDecorr[6].Process(m_sAmbL.data(), m_sHeightL.data(), frames);
             m_spatialDecorr[7].Process(m_sAmbR.data(), m_sHeightR.data(), frames);
@@ -1638,15 +1677,18 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 
     // --- OBJ_SUBBASS: the mid's own bass plus everything the wash gave up ---
     // Summing the objects first and filtering once is the same arithmetic as
-    // filtering each and summing, and costs two biquads instead of sixteen.
-    // The redirect is deliberately outside SubLevel: that knob is your taste in
-    // subwoofer weight, whereas this is bass management putting back what the
-    // surrounds were never able to voice.
+    // filtering each and summing, and costs two biquads per corner instead of
+    // sixteen. The redirect is deliberately outside SubLevel: that knob is
+    // your taste in subwoofer weight, whereas this is bass management putting
+    // back what the surrounds were never able to voice.
     m_washLp[0].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
     m_washLp[1].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
+    m_washLpHeight[0].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
+    m_washLpHeight[1].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
     {
         const float redirect = m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f;
-        for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] += m_sWashLow[i] * redirect;
+        for (uint32_t i = 0; i < frames; ++i)
+            m_sSubOut[i] += (m_sWashLow[i] + m_sWashLowHeight[i]) * redirect;
     }
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_SUBBASS, m_sSubOut.data(), frames);
 

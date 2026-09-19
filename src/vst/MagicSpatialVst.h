@@ -303,10 +303,18 @@ private:
     // wavelengths a symmetric pair cancels it at the seat in any case. The
     // low-mid envelopment feed is added in phase, so it survives, and it is
     // what mostly makes the journey to the sub.
-    static constexpr float kWashCutHz = 120.0f;
-    BiquadFilter m_washHp[8][2];    // [object][stage]
-    BiquadFilter m_washLp[2];       // on the summed redirect
-    std::vector<float> m_sWashLow;  // wash sum awaiting that lowpass
+    //
+    // The heights have their own corner. The up-firing pair reaches 100 Hz
+    // where the satellites stop at 120, so the height objects hand over at
+    // kHeightCutHz and their redirect is lowpassed there, separately, so each
+    // frequency is still reproduced exactly once.
+    static constexpr float kWashCutHz   = 120.0f;   // sides and backs
+    static constexpr float kHeightCutHz = 100.0f;   // top objects
+    BiquadFilter m_washHp[8][2];          // [object][stage]; objects 4-7 at kHeightCutHz
+    BiquadFilter m_washLp[2];             // on the summed surround redirect
+    BiquadFilter m_washLpHeight[2];       // on the summed height redirect
+    std::vector<float> m_sWashLow;        // surround wash sum awaiting its lowpass
+    std::vector<float> m_sWashLowHeight;  // height wash sum awaiting its lowpass
     std::vector<float> m_sSubOut;   // sub feed, held until the wash folds in
 
     // --- Spatial energy budget ---

@@ -62,11 +62,14 @@ public:
     // Check if spatial audio is ready to receive objects.
     bool IsActive() const { return m_active.load(std::memory_order_acquire); }
 
-    // True when OBJ_SUBBASS is carried as the stream's static LFE bed channel
-    // rather than a positioned dynamic object. An LFE bed reaches the
-    // subwoofer input directly, bypassing the renderer's speaker bass
-    // management; the receiver plays it 10 dB hotter than a main channel.
-    bool IsLfeBed() const { return m_lfeIsBed.load(std::memory_order_acquire); }
+    // Slots carried as static bed channels rather than positioned dynamic
+    // objects, as a bitmask over ObjectSlot. A bed maps one to one onto the
+    // renderer's speaker feed with no panning: the LFE bed reaches the
+    // subwoofer input directly, and a height bed reaches the height pair
+    // alone, where a steered object at an intermediate elevation is shared
+    // out between the heights and the fronts (and centre) beneath it.
+    bool IsBed(ObjectSlot slot) const { return ((m_bedMask.load(std::memory_order_acquire) >> slot) & 1u) != 0; }
+    bool IsLfeBed() const { return IsBed(OBJ_SUBBASS); }
 
     // Did activation fail? (call after a reasonable timeout)
     bool HasFailed() const { return m_failed.load(std::memory_order_acquire); }
@@ -127,10 +130,12 @@ private:
     };
     DynamicObject m_objects[OBJ_COUNT];
 
-    // Set during stream activation when the endpoint offers a static LFE bed
-    // channel; OBJ_SUBBASS is then activated as AudioObjectType_LowFrequency
-    // and excluded from the dynamic pool accounting.
-    std::atomic<bool> m_lfeIsBed{false};
+    // Set during stream activation from the endpoint's native static mask;
+    // each flagged slot is activated as its bed type and excluded from the
+    // dynamic pool accounting.
+    std::atomic<uint32_t> m_bedMask{0};
+    static AudioObjectType BedTypeForSlot(int slot);
+    UINT32 BedCount() const;
 
     HANDLE m_renderEvent = nullptr;
     UINT32 m_maxFrameCount = 0;

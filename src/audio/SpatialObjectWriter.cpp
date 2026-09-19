@@ -64,6 +64,24 @@ const SpatialObjectWriter::ObjectPosition SpatialObjectWriter::kDefaultPositions
     { 0.354f,  0.707f,  0.612f}, // OBJ_TOP_BACK_R: +150° azimuth, +45° elevation
 };
 
+AudioObjectType SpatialObjectWriter::BedTypeForSlot(int slot) {
+    switch (slot) {
+    case OBJ_SUBBASS:     return AudioObjectType_LowFrequency;
+    case OBJ_TOP_FRONT_L: return AudioObjectType_TopFrontLeft;
+    case OBJ_TOP_FRONT_R: return AudioObjectType_TopFrontRight;
+    case OBJ_TOP_BACK_L:  return AudioObjectType_TopBackLeft;
+    case OBJ_TOP_BACK_R:  return AudioObjectType_TopBackRight;
+    default:              return AudioObjectType_None;
+    }
+}
+
+UINT32 SpatialObjectWriter::BedCount() const {
+    uint32_t m = m_bedMask.load(std::memory_order_relaxed);
+    UINT32 n = 0;
+    for (; m != 0; m &= m - 1) ++n;
+    return n;
+}
+
 // --- IActivateAudioInterfaceCompletionHandler for async activation ---
 
 class SpatialActivationHandler : public IActivateAudioInterfaceCompletionHandler {
@@ -590,22 +608,37 @@ bool SpatialObjectWriter::ActivateSpatialAudio() {
     auto* notify = new SpatialNotify();
     notify->SetCountSink(&m_notifiedAvailable);
 
-    // Carry the sub-bass as a static LFE bed channel when the endpoint offers
-    // one. A dynamic object placed at a speaker only reaches the subwoofer
-    // through that speaker's bass management, which proved nearly inaudible on
-    // the reference rig; the LFE bed feeds the sub input directly.
+    // Carry the sub-bass and the height pairs as static bed channels when the
+    // endpoint offers them. A dynamic object placed at a speaker only reaches
+    // the subwoofer through that speaker's bass management, which proved
+    // nearly inaudible on the reference rig; the LFE bed feeds the sub input
+    // directly. A height object at 35-70 degrees is likewise panned by the
+    // renderer between the height pair and the speakers beneath it, so part
+    // of the height wash lands on the fronts and centre, where it can only
+    // smear the direct image; a height bed reaches the height speakers alone.
     AudioObjectType nativeStatic = AudioObjectType_None;
     hr = m_spatialClient->GetNativeStaticObjectTypeMask(&nativeStatic);
-    const bool lfeBed = SUCCEEDED(hr) && (nativeStatic & AudioObjectType_LowFrequency) != 0;
-    m_lfeIsBed.store(lfeBed, std::memory_order_release);
-    Log("[SpatialObjectWriter] Native static mask 0x%08X -> LFE bed %s\n",
-        static_cast<unsigned>(nativeStatic), lfeBed ? "yes" : "no (dynamic fallback)");
+    if (FAILED(hr)) nativeStatic = AudioObjectType_None;
+    uint32_t bedMask = 0;
+    unsigned staticTypes = 0;
+    for (int i = 0; i < OBJ_COUNT; ++i) {
+        const AudioObjectType t = BedTypeForSlot(i);
+        if (t != AudioObjectType_None && (nativeStatic & t) != 0) {
+            bedMask |= 1u << i;
+            staticTypes |= static_cast<unsigned>(t);
+        }
+    }
+    m_bedMask.store(bedMask, std::memory_order_release);
+    Log("[SpatialObjectWriter] Native static mask 0x%08X -> beds 0x%08X (LFE %s, heights %s)\n",
+        static_cast<unsigned>(nativeStatic), staticTypes,
+        ((bedMask >> OBJ_SUBBASS) & 1u) ? "yes" : "no",
+        ((bedMask >> OBJ_TOP_FRONT_L) & 1u) ? "yes" : "no");
 
     SpatialAudioObjectRenderStreamActivationParams streamParams{};
     streamParams.ObjectFormat = m_objectFormat;
-    streamParams.StaticObjectTypeMask = lfeBed ? AudioObjectType_LowFrequency : AudioObjectType_None;
+    streamParams.StaticObjectTypeMask = static_cast<AudioObjectType>(staticTypes);
     streamParams.MinDynamicObjectCount = 1;
-    streamParams.MaxDynamicObjectCount = static_cast<UINT32>(OBJ_COUNT) - (lfeBed ? 1u : 0u);
+    streamParams.MaxDynamicObjectCount = static_cast<UINT32>(OBJ_COUNT) - BedCount();
     streamParams.Category = AudioCategory_Media;
     streamParams.EventHandle = m_renderEvent;
     streamParams.NotifyObject = notify;
@@ -672,29 +705,35 @@ UINT32 SpatialObjectWriter::ActivateObjects() {
     // existing stream is ordinary lifecycle — unlike re-activating the *stream*,
     // which is the manoeuvre that destabilised the two-instance contention.
     UINT32 activated = 0;
-    const bool lfeBed = m_lfeIsBed.load(std::memory_order_acquire);
+    const uint32_t bedMask = m_bedMask.load(std::memory_order_acquire);
+    bool dynamicExhausted = false;
     for (int i = 0; i < OBJ_COUNT; ++i) {
         if (m_objects[i].active && m_objects[i].object) {
             ++activated;
             continue;
         }
-        const bool isBed = lfeBed && i == OBJ_SUBBASS;
+        const bool isBed = ((bedMask >> i) & 1u) != 0;
+        if (!isBed && dynamicExhausted) {
+            m_objects[i].active = false;
+            continue;
+        }
         HRESULT hr = m_renderStream->ActivateSpatialAudioObject(
-            isBed ? AudioObjectType_LowFrequency : AudioObjectType_Dynamic,
+            isBed ? BedTypeForSlot(i) : AudioObjectType_Dynamic,
             m_objects[i].object.GetAddressOf());
         if (SUCCEEDED(hr) && m_objects[i].object) {
             m_objects[i].active = true;
             ++activated;
         } else if (isBed) {
-            // The bed channel is ours alone and never contended; a failure here
+            // A bed channel is ours alone and never contended; a failure here
             // is a one-off, not a sign the dynamic pool is exhausted.
-            Log("[SpatialObjectWriter] LFE bed activation failed: 0x%08lX\n",
-                static_cast<unsigned long>(hr));
+            Log("[SpatialObjectWriter] Bed activation failed for slot %d: 0x%08lX\n",
+                i, static_cast<unsigned long>(hr));
             m_objects[i].active = false;
         } else {
-            // Pool exhausted — a peer holds the rest. Stop and report what we have.
+            // Pool exhausted - a peer holds the rest. Beds later in the slot
+            // order are still ours to claim; only the dynamic slots are skipped.
             m_objects[i].active = false;
-            break;
+            dynamicExhausted = true;
         }
     }
     return activated;
@@ -769,10 +808,11 @@ void SpatialObjectWriter::RenderLoop() {
             // Write audio to each active object, counting how many the engine
             // actually serves a buffer this pass.
             UINT32 served = 0;
+            const uint32_t bedMask = m_bedMask.load(std::memory_order_relaxed);
             for (int i = 0; i < OBJ_COUNT; ++i) {
                 if (!m_objects[i].active || !m_objects[i].object) continue;
 
-                if (!(i == OBJ_SUBBASS && m_lfeIsBed.load(std::memory_order_relaxed))) {
+                if (((bedMask >> i) & 1u) == 0) {
                     auto& pos = m_objects[i].position;
                     m_objects[i].object->SetPosition(pos.x, pos.y, pos.z);
                 }
@@ -844,8 +884,7 @@ void SpatialObjectWriter::RenderLoop() {
             // YIELDED: holding no objects. Idle on the stream and watch the free
             // pool. When it can fit our whole baseline again — sustained past the
             // reclaim debounce — re-claim our objects and resume.
-            const UINT32 dynamicTarget = m_objectTarget
-                - (m_lfeIsBed.load(std::memory_order_relaxed) ? 1u : 0u);
+            const UINT32 dynamicTarget = m_objectTarget - BedCount();
             if (dynamicTarget > 0 && availableDynamic >= dynamicTarget) {
                 const ULONGLONG now = GetTickCount64();
                 if (roomSince == 0) {
