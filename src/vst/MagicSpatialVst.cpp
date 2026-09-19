@@ -955,12 +955,8 @@ void MagicSpatialVst::InitSpatialDsp() {
 
     // --- Feature 5: Low-mid envelopment feed ---
     {
-        auto hp = DesignHighpass(kLowMidEnvLowHz, sr);
         auto lp = DesignLowpass(kLowMidEnvHighHz, sr);
-        for (int i = 0; i < 2; ++i) {
-            m_lowMidHp[i].SetCoeffs(hp);
-            m_lowMidLp[i].SetCoeffs(lp);
-        }
+        for (int i = 0; i < 2; ++i) m_lowMidLp[i].SetCoeffs(lp);
         m_sLowMid.resize(maxFrames);
 
         // This feed is a copy of the MID, the dominant content of the mix, so
@@ -1141,10 +1137,9 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
     m_spatialTransients.Process(m_sScratch.data(), m_sTransients.data(), frames);
 
-    // --- Feature 5: 100-250 Hz body of the mid (LR4 bandpass) ---
-    m_lowMidHp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
-    m_lowMidHp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
-    m_lowMidLp[0].Process(m_sLowMid.data(), m_sScratch.data(), frames);
+    // --- Feature 5: body of the mid below kLowMidEnvHighHz (LR4 lowpass) ---
+    // Its bottom is set later by each wash object's own corner.
+    m_lowMidLp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_lowMidLp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
 
     // --- Feature 2: Correlation-adaptive spatial extension gain ---
@@ -1220,15 +1215,6 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             ambFactor[b] = m_smoothAmbFactor[b];
         }
     }
-
-    // Adds a decorrelated copy of the low-mid body to dst, in phase. Not
-    // transient-ducked: the feed arrives with the fronts (no pre-delay, no
-    // diffuser), so a kick from behind reinforces rather than echoes.
-    auto addLowMidEnv = [&](int decorrIndex, float* dst, float gain) {
-        m_lowMidDecorr[decorrIndex].Process(m_sLowMid.data(), m_sScratch.data(), frames);
-        const float g = gain * spatialExtGain * ambFactor[1];
-        for (uint32_t i = 0; i < frames; ++i) dst[i] += m_sScratch[i] * g;
-    };
 
     // Dynamic L/R position steering: compute energy balance on the delayed mid
     // range and slide the dominant side's object slightly further outward.
@@ -1408,11 +1394,22 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // Measuring after the cut would have the normalizer read a quieter wash and
     // open it up to fill the budget, making the surrounds brighter for exactly
     // the change meant to settle them.
-    auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx) {
+    //
+    // The low-mid body joins here, between the redirect and the corner: a
+    // decorrelated copy of the mid, in phase, at lowMidGain. It is added after
+    // the pre-delay and diffuser (it must arrive with the fronts, and must not
+    // be combed by the diffuser's short delays) and is not transient-ducked
+    // (a kick from behind reinforces rather than echoes). The corner then
+    // sets its bottom, and it is counted in the budget but kept off the sub.
+    auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx,
+                          float lowMidGain) {
         float* low = (idx >= 4) ? m_sWashLowHeight.data() : m_sWashLow.data();
+        for (uint32_t i = 0; i < frames; ++i) low[i] += buf[i] * washGain;
+        m_lowMidDecorr[idx].Process(m_sLowMid.data(), m_sScratch.data(), frames);
+        const float g = lowMidGain * spatialExtGain * ambFactor[1];
         for (uint32_t i = 0; i < frames; ++i) {
+            buf[i] += m_sScratch[i] * g;
             washRawEnergy += buf[i] * buf[i];
-            low[i] += buf[i] * washGain;
         }
         m_washHp[idx][0].Process(buf, buf, frames);
         m_washHp[idx][1].Process(buf, buf, frames);
@@ -1525,13 +1522,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[0].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[1].Process(m_sSurrR.data(), frames);
         }
-        // Low-mid body joins AFTER the pre-delay and diffuser: it must arrive
-        // with the fronts, not 8 ms behind them, and it must not be combed by
-        // the diffuser's short delays.
-        addLowMidEnv(0, m_sSurrL.data(), kLowMidEnvGain);
-        addLowMidEnv(1, m_sSurrR.data(), kLowMidEnvGain);
-        submitWash(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_sSurrL.data(), 0);
-        submitWash(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), 1);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_LEFT,  m_sSurrL.data(), 0, kLowMidEnvGain);
+        submitWash(SpatialObjectWriter::OBJ_SIDE_RIGHT, m_sSurrR.data(), 1, kLowMidEnvGain);
     }
 
     // --- OBJ_BACK_LEFT/RIGHT: band 2 (presence depth, 2k-8k) ---
@@ -1577,10 +1569,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_rearDiffuser[2].Process(m_sSurrL.data(), frames);
             m_rearDiffuser[3].Process(m_sSurrR.data(), frames);
         }
-        addLowMidEnv(2, m_sSurrL.data(), kLowMidEnvGain);
-        addLowMidEnv(3, m_sSurrR.data(), kLowMidEnvGain);
-        submitWash(SpatialObjectWriter::OBJ_BACK_LEFT,  m_sSurrL.data(), 2);
-        submitWash(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), 3);
+        submitWash(SpatialObjectWriter::OBJ_BACK_LEFT,  m_sSurrL.data(), 2, kLowMidEnvGain);
+        submitWash(SpatialObjectWriter::OBJ_BACK_RIGHT, m_sSurrR.data(), 3, kLowMidEnvGain);
     }
 
     // ================================================================
@@ -1631,10 +1621,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             m_sHeightL[i] *= spatialExtGain;
             m_sHeightR[i] *= spatialExtGain;
         }
-        addLowMidEnv(4, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-        addLowMidEnv(5, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), 4);
-        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), 5);
+        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_L, m_sHeightL.data(), 4,
+                   kLowMidEnvGain * kLowMidEnvHeightGain);
+        submitWash(SpatialObjectWriter::OBJ_TOP_FRONT_R, m_sHeightR.data(), 5,
+                   kLowMidEnvGain * kLowMidEnvHeightGain);
 
         // --- OBJ_TOP_BACK_L/R: only fed when the layout has a physical
         //     rear-height pair. Otherwise submit silence (its content was
@@ -1655,10 +1645,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
                 m_sHeightL[i] *= spatialExtGain;
                 m_sHeightR[i] *= spatialExtGain;
             }
-            addLowMidEnv(6, m_sHeightL.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-            addLowMidEnv(7, m_sHeightR.data(), kLowMidEnvGain * kLowMidEnvHeightGain);
-            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), 6);
-            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), 7);
+            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_L, m_sHeightL.data(), 6,
+                       kLowMidEnvGain * kLowMidEnvHeightGain);
+            submitWash(SpatialObjectWriter::OBJ_TOP_BACK_R, m_sHeightR.data(), 7,
+                       kLowMidEnvGain * kLowMidEnvHeightGain);
         } else {
             const float* silence = m_silenceBuffer.data();
             // Defensive: m_silenceBuffer should be sized in effSetBlockSize,
