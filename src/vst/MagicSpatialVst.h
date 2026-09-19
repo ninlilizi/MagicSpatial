@@ -42,11 +42,12 @@ enum class SpeakerLayout {
 //   3 - Volume:   -12..+12 dB
 //   4 - LfeCut:   40 / 65 / 80 / 100 / 120 Hz sub-bass crossover
 //   5 - SubLevel: -12..+6 dB of sub weight around a level match with bypass
+//   6 - BassMgmt: Plugin / Receiver - who owns the speaker crossovers
 class MagicSpatialVst {
 public:
     static constexpr int kNumInputs  = 12;
     static constexpr int kNumOutputs = 12;
-    static constexpr int kNumParams  = 6;
+    static constexpr int kNumParams  = 7;
 
     static constexpr VstInt32 kUniqueID = 'MgSp';
 
@@ -83,7 +84,7 @@ private:
     audioMasterCallback m_hostCallback;
 
     // Editor
-    ERect m_editorRect{0, 0, 250, 340};
+    ERect m_editorRect{0, 0, 250, 370};
     void* m_editorHwnd = nullptr;  // HWND of our child window
 
     // Parameters
@@ -115,6 +116,26 @@ private:
     int   LfeCutIndex() const;
     float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
 
+    // Who owns the crossovers. An AV receiver rendering the Atmos stream
+    // applies its own speaker-size bass management to the speaker feeds it
+    // renders, after the plugin has already done the same to the objects. Two
+    // LR4 highpasses at one corner leave the speaker 12 dB down there instead
+    // of 6, and the receiver's redirect then finds nothing left to hand the
+    // sub, so the acoustic sum has a hole of about 4 dB around every corner.
+    // It has to be done on one side only, and it cannot be split: if the
+    // plugin kept its redirect while dropping its highpass, the receiver would
+    // redirect the same bass again and the sub would carry it twice.
+    //
+    // Receiver: every object leaves full range, nothing is redirected and the
+    // LFE bed carries only what a multichannel source put there. The one
+    // exception is the low-mid body feed, which is a copy of the mid on six
+    // speakers; the receiver would redirect all six copies' bass to the sub
+    // on top of the fronts' own, so that feed alone still takes its object's
+    // corner inside the plugin. LfeCut and SubLevel are inert in this mode;
+    // the receiver's crossover and level settings take their place.
+    float m_paramBassMgmt = 0.0f;  // Plugin
+    bool  ReceiverBassMgmt() const { return m_paramBassMgmt >= 0.5f; }
+
 
     // Processing state
     UpmixEngine m_engine;
@@ -122,6 +143,13 @@ private:
     VstInt32 m_blockSize = 4096;
     bool m_engineInitialized = false;
     InputLayout m_currentLayout = InputLayout::Unknown;
+
+    // Diagnostics written from the render entry point, on change only: the
+    // parameter set this instance is rendering with, and whether it is
+    // rendering spatial objects or has fallen back to channel output.
+    int  m_loggedParamKey = -1;
+    int  m_loggedRenderState = -1;
+    void LogRenderState(InputLayout layout);
 
     // Layout-detection hysteresis. Once committed to a layout, we require the
     // raw signal-energy detection to report a DIFFERENT layout for

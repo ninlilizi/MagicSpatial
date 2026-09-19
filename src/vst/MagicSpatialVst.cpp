@@ -25,6 +25,7 @@ enum EditorCtrlID {
     ID_GAIN_SLIDER        = 1006,
     ID_LFE_CUT_COMBO      = 1007,
     ID_SUB_LEVEL_COMBO    = 1008,
+    ID_BASS_MGMT_COMBO    = 1009,
 };
 
 // Master-gain parameter mapping. Normalized 0..1 ↔ -12..+12 dB, 0.5 = unity.
@@ -77,6 +78,10 @@ static LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             else if (id == ID_SUB_LEVEL_COMBO) {
                 plugin->m_paramSubLevel = static_cast<float>(sel) / 6.0f;
+            }
+            else if (id == ID_BASS_MGMT_COMBO) {
+                // sel: 0 = Plugin, 1 = Receiver
+                plugin->m_paramBassMgmt = (sel == 0) ? 0.0f : 1.0f;
             }
         }
         return 0;
@@ -133,6 +138,20 @@ static void VSTCALLBACK processReplacingCallback(AEffect* effect,
 {
     auto* plugin = static_cast<MagicSpatialVst*>(effect->object);
     plugin->ProcessReplacing(inputs, outputs, sampleFrames);
+}
+
+// Parameter names and displays. kVstMaxParamStrLen is 8, and a bare strncpy
+// of eight characters leaves no terminator, so a host reading the name into
+// its own larger buffer (E-APO uses 256 bytes) sees the name followed by
+// whatever the stack held. "BassMgmt" and "SubLevel" are exactly eight
+// characters and "SurroundPos" truncates to eight, and E-APO matches config
+// entries to parameters by that name, so whether those three applied at all
+// depended on a stray zero byte. Hosts allocate at least the length plus a
+// terminator, as the SDK's own vst_strncpy assumes, so the terminator is
+// written at index kVstMaxParamStrLen.
+static void CopyParamString(char* dst, const char* src) {
+    std::strncpy(dst, src, kVstMaxParamStrLen);
+    dst[kVstMaxParamStrLen] = '\0';
 }
 
 static void VSTCALLBACK setParameterCallback(AEffect* effect, VstInt32 index, float value) {
@@ -375,6 +394,22 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         SendMessageW(subCombo, CB_SETCURSEL, SubLevelIndex(), 0);
         y += 30;
 
+        // --- Bass management owner combo ---
+        // Receiver: the AV receiver's speaker-size crossovers do the whole
+        // job and the plugin sends every object full range, so no corner is
+        // crossed twice.
+        CreateWindowW(L"STATIC", L"Bass mgmt:",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, y + 2, labelW, 20, hwnd, nullptr, hInst, nullptr);
+        HWND bassCombo = CreateWindowW(L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            ctrlX, y, ctrlW, 100, hwnd,
+            reinterpret_cast<HMENU>(ID_BASS_MGMT_COMBO), hInst, nullptr);
+        SendMessageW(bassCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Plugin"));
+        SendMessageW(bassCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Receiver"));
+        SendMessageW(bassCombo, CB_SETCURSEL, ReceiverBassMgmt() ? 1 : 0, 0);
+        y += 30;
+
         // --- Master Volume (shared-mode output gain) ---
         // Continuous -12..+12 dB trim on everything we emit. Helpful when
         // shared-mode Atmos arrives quieter than stereo. Does NOT touch
@@ -427,12 +462,13 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
         if (ptr) {
             char* buf = static_cast<char*>(ptr);
             switch (index) {
-            case 0: std::strncpy(buf, "Mode",        kVstMaxParamStrLen); break;
-            case 1: std::strncpy(buf, "Speakers",    kVstMaxParamStrLen); break;
-            case 2: std::strncpy(buf, "SurroundPos", kVstMaxParamStrLen); break;
-            case 3: std::strncpy(buf, "Volume",      kVstMaxParamStrLen); break;
-            case 4: std::strncpy(buf, "LfeCut",      kVstMaxParamStrLen); break;
-            case 5: std::strncpy(buf, "SubLevel",    kVstMaxParamStrLen); break;
+            case 0: CopyParamString(buf, "Mode"); break;
+            case 1: CopyParamString(buf, "Speakers"); break;
+            case 2: CopyParamString(buf, "SurroundPos"); break;
+            case 3: CopyParamString(buf, "Volume"); break;
+            case 4: CopyParamString(buf, "LfeCut"); break;
+            case 5: CopyParamString(buf, "SubLevel"); break;
+            case 6: CopyParamString(buf, "BassMgmt"); break;
             }
         }
         return 0;
@@ -446,37 +482,40 @@ VstIntPtr MagicSpatialVst::Dispatcher(VstInt32 opcode, VstInt32 index,
             char* buf = static_cast<char*>(ptr);
             switch (index) {
             case 0:
-                if      (m_paramMode < 0.125f) std::strncpy(buf, "Auto",   kVstMaxParamStrLen);
-                else if (m_paramMode < 0.375f) std::strncpy(buf, "Stereo", kVstMaxParamStrLen);
-                else if (m_paramMode < 0.625f) std::strncpy(buf, "5.1",    kVstMaxParamStrLen);
-                else if (m_paramMode < 0.875f) std::strncpy(buf, "7.1",    kVstMaxParamStrLen);
-                else                           std::strncpy(buf, "Pass",   kVstMaxParamStrLen);
+                if      (m_paramMode < 0.125f) CopyParamString(buf, "Auto");
+                else if (m_paramMode < 0.375f) CopyParamString(buf, "Stereo");
+                else if (m_paramMode < 0.625f) CopyParamString(buf, "5.1");
+                else if (m_paramMode < 0.875f) CopyParamString(buf, "7.1");
+                else                           CopyParamString(buf, "Pass");
                 break;
             case 1:
-                if      (m_paramSpeakers < 0.075f) std::strncpy(buf, "2.0",   kVstMaxParamStrLen);
-                else if (m_paramSpeakers < 0.225f) std::strncpy(buf, "5.1",   kVstMaxParamStrLen);
-                else if (m_paramSpeakers < 0.375f) std::strncpy(buf, "5.1.2", kVstMaxParamStrLen);
-                else if (m_paramSpeakers < 0.525f) std::strncpy(buf, "5.1.4", kVstMaxParamStrLen);
-                else if (m_paramSpeakers < 0.675f) std::strncpy(buf, "7.1",   kVstMaxParamStrLen);
-                else if (m_paramSpeakers < 0.825f) std::strncpy(buf, "7.1.2", kVstMaxParamStrLen);
-                else                               std::strncpy(buf, "7.1.4", kVstMaxParamStrLen);
+                if      (m_paramSpeakers < 0.075f) CopyParamString(buf, "2.0");
+                else if (m_paramSpeakers < 0.225f) CopyParamString(buf, "5.1");
+                else if (m_paramSpeakers < 0.375f) CopyParamString(buf, "5.1.2");
+                else if (m_paramSpeakers < 0.525f) CopyParamString(buf, "5.1.4");
+                else if (m_paramSpeakers < 0.675f) CopyParamString(buf, "7.1");
+                else if (m_paramSpeakers < 0.825f) CopyParamString(buf, "7.1.2");
+                else                               CopyParamString(buf, "7.1.4");
                 break;
             case 2:
-                if (m_paramSurroundPos < 0.5f) std::strncpy(buf, "Side", kVstMaxParamStrLen);
-                else                           std::strncpy(buf, "Rear", kVstMaxParamStrLen);
+                if (m_paramSurroundPos < 0.5f) CopyParamString(buf, "Side");
+                else                           CopyParamString(buf, "Rear");
                 break;
             case 3:
-                std::snprintf(buf, kVstMaxParamStrLen, "%+.1f dB",
+                std::snprintf(buf, kVstMaxParamStrLen + 1, "%+.1f dB",
                               GainNormToDb(m_paramMasterGain));
                 break;
             case 4:
-                std::snprintf(buf, kVstMaxParamStrLen, "%d Hz",
+                std::snprintf(buf, kVstMaxParamStrLen + 1, "%d Hz",
                               static_cast<int>(LfeCutoffHz()));
                 break;
             case 5:
-                if (SubLevelDb() == 0.0f) std::strncpy(buf, "Match", kVstMaxParamStrLen);
-                else std::snprintf(buf, kVstMaxParamStrLen, "%+d dB",
+                if (SubLevelDb() == 0.0f) CopyParamString(buf, "Match");
+                else std::snprintf(buf, kVstMaxParamStrLen + 1, "%+d dB",
                                    static_cast<int>(SubLevelDb()));
+                break;
+            case 6:
+                CopyParamString(buf, ReceiverBassMgmt() ? "Receiver" : "Plugin");
                 break;
             }
         }
@@ -515,6 +554,33 @@ void MagicSpatialVst::SetParameter(VstInt32 index, float value) {
     case 5:
         m_paramSubLevel = value;
         break;
+    case 6:
+        m_paramBassMgmt = value;
+        break;
+    }
+}
+
+void MagicSpatialVst::LogRenderState(InputLayout layout) {
+    const int key = (LfeCutIndex() << 0) | (SubLevelIndex() << 4)
+                  | ((ReceiverBassMgmt() ? 1 : 0) << 8)
+                  | (static_cast<int>(m_paramMode * 4.0f + 0.5f) << 9)
+                  | (static_cast<int>(m_paramSpeakers * 100.0f + 0.5f) << 12)
+                  | ((m_paramSurroundPos >= 0.5f ? 1 : 0) << 19)
+                  | (static_cast<int>(m_paramMasterGain * 100.0f + 0.5f) << 20);
+    if (key != m_loggedParamKey) {
+        m_loggedParamKey = key;
+        LogMsg("params: Mode=%.2f Speakers=%.2f Surround=%s BassMgmt=%s LfeCut=%d Hz "
+               "SubLevel=%+d dB Volume=%.2f\n",
+               m_paramMode, m_paramSpeakers, m_paramSurroundPos >= 0.5f ? "Rear" : "Side",
+               ReceiverBassMgmt() ? "Receiver" : "Plugin",
+               static_cast<int>(LfeCutoffHz()), static_cast<int>(SubLevelDb()),
+               m_paramMasterGain);
+    }
+    const int state = (m_spatialWriter.IsActive() ? 1 : 0) | (static_cast<int>(layout) << 1);
+    if (state != m_loggedRenderState) {
+        m_loggedRenderState = state;
+        LogMsg("render: layout=%d spatial=%s\n", static_cast<int>(layout),
+               m_spatialWriter.IsActive() ? "active (objects)" : "INACTIVE (channel fallback)");
     }
 }
 
@@ -536,6 +602,7 @@ float MagicSpatialVst::GetParameter(VstInt32 index) {
     case 3: return m_paramMasterGain;
     case 4: return m_paramLfeCut;
     case 5: return m_paramSubLevel;
+    case 6: return m_paramBassMgmt;
     default: return 0.0f;
     }
 }
@@ -741,6 +808,8 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
         targetLayout = InputLayout::Passthrough;
     }
 
+    LogRenderState(targetLayout);
+
     // --- Spatial-object mode dispatch ---
     //
     // Two object-based paths exist. The stereo path runs heavy DSP (spectral
@@ -845,12 +914,35 @@ void MagicSpatialVst::UpdateEngine() {
     m_engineInitialized = false;
 }
 
+// E-APO's Configuration Editor runs the whole filter chain in its own process
+// for the analysis panel, so it does process audio, and its instance used to
+// start a writer of its own. Two writers on one endpoint take turns seizing
+// the single spatial stream, each seizure reads as an endpoint change to the
+// other, E-APO recreates the chain on every change, and the two chase each
+// other several times a second until the audio service gives out. The
+// editor's instance gets the channel fallback instead, which is all the
+// analysis panel needs.
+static bool IsEapoToolProcess() {
+    wchar_t path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return false;
+    const wchar_t* name = path;
+    for (const wchar_t* p = path; *p; ++p) {
+        if (*p == L'\\' || *p == L'/') name = p + 1;
+    }
+    return _wcsicmp(name, L"Editor.exe") == 0 || _wcsicmp(name, L"Benchmark.exe") == 0;
+}
+
 void MagicSpatialVst::EnsureSpatialWriterStarted() {
     // compare_exchange ensures exactly one spawn even if effMainsChanged and
     // ProcessReplacing race on the first block. Initialize() itself is also
     // idempotent, but the atomic keeps us from ever calling it twice.
     bool expected = false;
     if (m_spatialInitAttempted.compare_exchange_strong(expected, true)) {
+        if (IsEapoToolProcess()) {
+            LogMsg("Spatial writer withheld: E-APO tool process, channel fallback only\n");
+            return;
+        }
         m_spatialWriter.Initialize();
         LogMsg("Spatial writer started\n");
     }
@@ -1072,6 +1164,7 @@ void MagicSpatialVst::ApplyLfeCutoff() {
 void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, VstInt32 sampleFrames) {
     InitSpatialDsp();
     ApplyLfeCutoff();
+    const bool receiverBass = ReceiverBassMgmt();
 
     // Apply user's surround-position override (Side vs Rear). Cheap (2
     // SetObjectPosition calls when the override is active, zero calls when
@@ -1393,9 +1486,13 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // path sums, and ran 2.9 dB light for it.
     // Held in m_sSubOut rather than submitted here: the wash has not been built
     // yet, and its own redirected bass has to join this before the object goes.
-    m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sSubOut.data(), frames);
-    m_spatialLfeLowpass[1].Process(m_sSubOut.data(), m_sSubOut.data(), frames);
-    {
+    // With the receiver managing bass the fronts leave full range and the
+    // receiver's own redirect feeds the sub, so the bed carries nothing here.
+    if (receiverBass) {
+        std::memset(m_sSubOut.data(), 0, frames * sizeof(float));
+    } else {
+        m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sSubOut.data(), frames);
+        m_spatialLfeLowpass[1].Process(m_sSubOut.data(), m_sSubOut.data(), frames);
         const float subGain = SubLevelLinear() * (2.0f / kGlobalOutputGain)
                             * (m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f);
         for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] *= subGain;
@@ -1429,8 +1526,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // Hand everything below LfeCut to the sub, whose lowpass is complementary
     // to this highpass, so the fronts play down to their own limit and no
     // further and each frequency is reproduced exactly once.
-    for (auto& f : m_frontHp[0]) f.Process(m_sResidualL.data(), m_sResidualL.data(), frames);
-    for (auto& f : m_frontHp[1]) f.Process(m_sResidualR.data(), m_sResidualR.data(), frames);
+    if (!receiverBass) {
+        for (auto& f : m_frontHp[0]) f.Process(m_sResidualL.data(), m_sResidualL.data(), frames);
+        for (auto& f : m_frontHp[1]) f.Process(m_sResidualR.data(), m_sResidualR.data(), frames);
+    }
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_LEFT, rL, frames);
     m_spatialWriter.SubmitObjectAudio(SpatialObjectWriter::OBJ_RIGHT, rR, frames);
 
@@ -1461,8 +1560,17 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     auto submitWash = [&](SpatialObjectWriter::ObjectSlot slot, float* buf, int idx,
                           float lowMidGain, float snapGain) {
         float* low = (idx >= 4) ? m_sWashLowHeight.data() : m_sWashLow.data();
-        for (uint32_t i = 0; i < frames; ++i) low[i] += buf[i] * washGain;
+        if (!receiverBass) {
+            for (uint32_t i = 0; i < frames; ++i) low[i] += buf[i] * washGain;
+        }
         m_lowMidDecorr[idx].Process(m_sLowMid.data(), m_sScratch.data(), frames);
+        if (receiverBass) {
+            // The receiver redirects whatever bass reaches this object, and
+            // six coherent copies of the mid's bass would land on the sub on
+            // top of the fronts' own. The body feed alone takes the corner.
+            m_washHp[idx][0].Process(m_sScratch.data(), m_sScratch.data(), frames);
+            m_washHp[idx][1].Process(m_sScratch.data(), m_sScratch.data(), frames);
+        }
         const float g = lowMidGain * spatialExtGain * ambFactor[1];
         for (uint32_t i = 0; i < frames; ++i) buf[i] += m_sScratch[i] * g;
         m_snapDecorr[idx].Process(m_sSnap.data(), m_sScratch.data(), frames);
@@ -1470,8 +1578,10 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             buf[i] += m_sScratch[i] * snapGain;
             washRawEnergy += buf[i] * buf[i];
         }
-        m_washHp[idx][0].Process(buf, buf, frames);
-        m_washHp[idx][1].Process(buf, buf, frames);
+        if (!receiverBass) {
+            m_washHp[idx][0].Process(buf, buf, frames);
+            m_washHp[idx][1].Process(buf, buf, frames);
+        }
         for (uint32_t i = 0; i < frames; ++i) buf[i] *= washGain;
         m_spatialWriter.SubmitObjectAudio(slot, buf, frames);
     };
@@ -1683,11 +1793,11 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // sixteen. The redirect is deliberately outside SubLevel: that knob is
     // your taste in subwoofer weight, whereas this is bass management putting
     // back what the surrounds were never able to voice.
-    m_washLp[0].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
-    m_washLp[1].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
-    m_washLpHeight[0].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
-    m_washLpHeight[1].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
-    {
+    if (!receiverBass) {
+        m_washLp[0].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
+        m_washLp[1].Process(m_sWashLow.data(), m_sWashLow.data(), frames);
+        m_washLpHeight[0].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
+        m_washLpHeight[1].Process(m_sWashLowHeight.data(), m_sWashLowHeight.data(), frames);
         const float redirect = m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f;
         for (uint32_t i = 0; i < frames; ++i)
             m_sSubOut[i] += (m_sWashLow[i] + m_sWashLowHeight[i]) * redirect;
@@ -1789,10 +1899,18 @@ void MagicSpatialVst::ProcessMultichannelObjects(float** inputs, float** outputs
     ApplyLfeCutoff();
     std::memset(m_mcBedSum.data(), 0, frames * sizeof(float));
     const float* lfeInput = silence;
+    const bool receiverBass = ReceiverBassMgmt();
     bool fed[SpatialObjectWriter::OBJ_COUNT] = { false };
     auto submit = [&](SpatialObjectWriter::ObjectSlot slot, int ch) {
         if (slot == SpatialObjectWriter::OBJ_SUBBASS) {
             lfeInput = inputs[ch];   // joined with the redirected bass below
+            return;
+        }
+        if (receiverBass) {
+            // Full range to the object; the receiver crosses it over and the
+            // bed carries the source's own LFE alone.
+            m_spatialWriter.SubmitObjectAudio(slot, inputs[ch], frames);
+            fed[slot] = true;
             return;
         }
         m_mcHp[ch][0].Process(inputs[ch], m_mcHpOut.data(), frames);
