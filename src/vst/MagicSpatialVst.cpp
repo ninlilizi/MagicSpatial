@@ -765,12 +765,11 @@ void MagicSpatialVst::ProcessReplacing(float** inputs, float** outputs, VstInt32
     InputLayout targetLayout;
     if (m_paramMode < 0.125f) {
         InputLayout raw = DetectLayoutFromInputs(inputs, sampleFrames);
-        // Evidence required before committing. Dropping a multichannel layout
-        // for stereo needs the long grace period; every other transition keeps
-        // the short one.
+        // Evidence required before committing. Dropping to a smaller layout
+        // (7.1 to 5.1 as much as anything to stereo) needs the long grace
+        // period; growing into a larger one keeps the short one.
         auto holdSamplesFor = [&](InputLayout candidate) {
-            int ms = (candidate == InputLayout::Stereo &&
-                      m_committedLayout != InputLayout::Stereo)
+            int ms = (candidate < m_committedLayout)
                          ? kLayoutReleaseHoldMs
                          : kLayoutHysteresisMs;
             return static_cast<int>(m_sampleRate * ms / 1000.0f);
@@ -976,9 +975,17 @@ void MagicSpatialVst::InitSpatialDsp() {
     // runs a chain with one more section on the left than the right, breaks
     // interleaved, so the two chains sit close to 180 degrees apart from
     // below the pair's wash corner upward; with the inversion the copies add
-    // at the seat across the band (+3 dB over an uncorrelated pair, no null
-    // anywhere). Delays are equal within a pair on purpose: an offset of even
-    // three samples walks the pair back into a null in the treble.
+    // at the seat through the mid range (+3 dB over an uncorrelated pair, no
+    // null anywhere the head does not shadow). Held 180 degrees apart at
+    // every frequency, though, the two speakers of a pair play the SAME
+    // signal, treble included, and a coherent treble phantom from behind and
+    // above was heard as the whole image lifting and brightening. The stock
+    // presets had left the treble diffuse, so each pair keeps a small delay
+    // offset (four samples on the surrounds, six on the heights): measured
+    // on the real chains the seat sum stays within 1 dB of coherent to
+    // 2 kHz and is uncorrelated by 3 kHz, with the first seat null at 6 kHz
+    // (4 kHz for the heights), above the head shadow where the ears hear
+    // each speaker on its own.
     //
     // The sides and backs share one design and one delay, since on a 5.1
     // layout both land on the same rear speakers, and identical chains let
@@ -997,13 +1004,13 @@ void MagicSpatialVst::InitSpatialDsp() {
         for (int c = 0; c < 5; ++c) hl[c]  = AllpassCoeffForBreakHz(kHeightBreaksL[c], sr);
         for (int c = 0; c < 4; ++c) hr[c]  = AllpassCoeffForBreakHz(kHeightBreaksR[c], sr);
         m_spatialDecorr[0].Initialize(sl, 6, 7);    // SL
-        m_spatialDecorr[1].Initialize(srr, 5, 7);   // SR
+        m_spatialDecorr[1].Initialize(srr, 5, 11);  // SR
         m_spatialDecorr[2].Initialize(sl, 6, 7);    // BL
-        m_spatialDecorr[3].Initialize(srr, 5, 7);   // BR
+        m_spatialDecorr[3].Initialize(srr, 5, 11);  // BR
         m_spatialDecorr[4].Initialize(hl, 5, 23);   // TFL
-        m_spatialDecorr[5].Initialize(hr, 4, 23);   // TFR
+        m_spatialDecorr[5].Initialize(hr, 4, 29);   // TFR
         m_spatialDecorr[6].Initialize(sl, 6, 23);   // TBL
-        m_spatialDecorr[7].Initialize(srr, 5, 23);  // TBR
+        m_spatialDecorr[7].Initialize(srr, 5, 29);  // TBR
     }
 
     // Pre-allocate all scratch buffers (#1: no heap allocation on audio thread)
@@ -1740,10 +1747,18 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             // don't over-emphasise the top. The (!hasTopBack) fold adds
             // extra band 2/3 to substitute for the missing physical
             // top-back pair.
-            float frontBlend = m_sSide0[i] * 6.0f + m_sSide1[i] * 6.0f
-                             + m_sSide2[i] * 4.5f + m_sSide3[i] * 1.5f;
+            //
+            // Gated by the per-band correlation weight like the sides and
+            // backs. Without it, on correlated music the sides' main terms
+            // were halved by the floor while these stayed at full, and the
+            // height pair alone carried two thirds of the wash power: the
+            // ceiling bounce of two small drivers at nearly the fronts' level
+            // in the low-mids, which is heard as the whole image lifting and
+            // brightening.
+            float frontBlend = m_sSide0[i] * 6.0f + m_sSide1[i] * 6.0f * sw[1]
+                             + m_sSide2[i] * 4.5f * sw[2] + m_sSide3[i] * 1.5f * sw[3];
             if (!hasTopBack) {
-                frontBlend += m_sSide2[i] * 2.0f + m_sSide3[i] * 1.5f;
+                frontBlend += m_sSide2[i] * 2.0f * sw[2] + m_sSide3[i] * 1.5f * sw[3];
             }
             // Not transient-ducked: the heights have no pre-delay and no
             // diffuser, so a transient from above arrives with the fronts and
@@ -1771,8 +1786,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
             // physical top-back drivers (which may have their own crossover
             // to LFE just like any other speaker pair).
             for (uint32_t i = 0; i < frames; ++i) {
-                float backBlend = m_sSide0[i] * 2.0f + m_sSide1[i] * 2.0f
-                                + m_sSide2[i] * 3.5f + m_sSide3[i] * 5.0f;
+                float backBlend = m_sSide0[i] * 2.0f + m_sSide1[i] * 2.0f * sw[1]
+                                + m_sSide2[i] * 3.5f * sw[2] + m_sSide3[i] * 5.0f * sw[3];
                 m_sAmbL[i] =  backBlend;
                 m_sAmbR[i] = -backBlend;
             }

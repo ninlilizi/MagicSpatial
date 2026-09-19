@@ -165,11 +165,15 @@ private:
     // consistent detection. Keeps responsiveness stable across host block sizes
     // (20-block constant drifted between 53 ms @ 128-sample and 1.7 s @ 4096).
     static constexpr int kLayoutHysteresisMs = 200;
-    // Releasing a multichannel layout back to stereo is held far longer. A
-    // game that drops its native surround stream for a second between maps
-    // would otherwise drag any concurrent stereo audio (music, a video) into
-    // the upmix path and straight back out again. Acquiring a layout stays on
-    // the short constant above, so surround still engages promptly.
+    // Releasing a layout for a smaller one is held far longer. A game that
+    // drops its native surround stream for a second between maps would
+    // otherwise drag any concurrent stereo audio (music, a video) into the
+    // upmix path and straight back out again, and a 7.1 game whose side pair
+    // falls quiet for a moment would be re-read as 5.1, which relabels its
+    // back pair as sides and discards the side channels until they carry
+    // signal again, so the attack of the next side-only sound was lost.
+    // Acquiring a larger layout stays on the short constant above, so
+    // surround still engages promptly.
     static constexpr int kLayoutReleaseHoldMs = 5000;
 
     // In-process spatial object output via ISpatialAudioClient
