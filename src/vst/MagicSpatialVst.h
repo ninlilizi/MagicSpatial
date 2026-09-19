@@ -112,7 +112,7 @@ private:
     // sel * 0.2 over kLfeCutChoices; decoded at the midpoints.
     static constexpr int   kLfeCutCount = 5;
     static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 65.0f, 80.0f, 100.0f, 120.0f};
-    float m_paramLfeCut = 0.2f;  // 65 Hz
+    float m_paramLfeCut = 0.4f;  // 80 Hz
     int   LfeCutIndex() const;
     float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
 
@@ -133,7 +133,7 @@ private:
     // on top of the fronts' own, so that feed alone still takes its object's
     // corner inside the plugin. LfeCut and SubLevel are inert in this mode;
     // the receiver's crossover and level settings take their place.
-    float m_paramBassMgmt = 0.0f;  // Plugin
+    float m_paramBassMgmt = 1.0f;  // Receiver
     bool  ReceiverBassMgmt() const { return m_paramBassMgmt >= 0.5f; }
 
 

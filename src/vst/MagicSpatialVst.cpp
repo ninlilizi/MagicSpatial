@@ -1487,15 +1487,24 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     // Held in m_sSubOut rather than submitted here: the wash has not been built
     // yet, and its own redirected bass has to join this before the object goes.
     // With the receiver managing bass the fronts leave full range and the
-    // receiver's own redirect feeds the sub, so the bed carries nothing here.
-    if (receiverBass) {
-        std::memset(m_sSubOut.data(), 0, frames * sizeof(float));
-    } else {
-        m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sSubOut.data(), frames);
-        m_spatialLfeLowpass[1].Process(m_sSubOut.data(), m_sSubOut.data(), frames);
-        const float subGain = SubLevelLinear() * (2.0f / kGlobalOutputGain)
-                            * (m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f);
-        for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] *= subGain;
+    // receiver's own redirect feeds the sub, so Match sends nothing here.
+    // SubLevel keeps its steps above Match as a lift: the bed carries the
+    // mid's bass below LfeCut scaled by the step's surplus over unity, so it
+    // adds to the receiver's redirect rather than replacing it and no corner
+    // is crossed twice. The steps below Match stay silent, since nothing the
+    // plugin sends can take away what the receiver redirects on its own.
+    {
+        const float lift = receiverBass ? std::max(SubLevelLinear() - 1.0f, 0.0f)
+                                        : SubLevelLinear();
+        if (lift <= 0.0f) {
+            std::memset(m_sSubOut.data(), 0, frames * sizeof(float));
+        } else {
+            m_spatialLfeLowpass[0].Process(m_sFullMid.data(), m_sSubOut.data(), frames);
+            m_spatialLfeLowpass[1].Process(m_sSubOut.data(), m_sSubOut.data(), frames);
+            const float subGain = lift * (2.0f / kGlobalOutputGain)
+                                * (m_spatialWriter.IsLfeBed() ? kBassRedirectGain : 1.0f);
+            for (uint32_t i = 0; i < frames; ++i) m_sSubOut[i] *= subGain;
+        }
     }
 
     // --- OBJ_VOCAL: discrete centre mixed IN ON TOP of the phantom ---
@@ -1567,9 +1576,15 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         if (receiverBass) {
             // The receiver redirects whatever bass reaches this object, and
             // six coherent copies of the mid's bass would land on the sub on
-            // top of the fronts' own. The body feed alone takes the corner.
+            // top of the fronts' own. The body feed alone takes the corner,
+            // and only one stage of it: the receiver's own highpass on a
+            // Small speaker is a second-order Butterworth (the THX recipe,
+            // 12 dB/oct up, 24 dB/oct down to the sub), so this stage and
+            // the receiver's together form exactly the LR4 the Plugin path
+            // applies. Both stages here would leave the feed 12 dB down at
+            // the corner and 3 dB down at 150 Hz, which is the very body
+            // the feed exists to supply.
             m_washHp[idx][0].Process(m_sScratch.data(), m_sScratch.data(), frames);
-            m_washHp[idx][1].Process(m_sScratch.data(), m_sScratch.data(), frames);
         }
         const float g = lowMidGain * spatialExtGain * ambFactor[1];
         for (uint32_t i = 0; i < frames; ++i) buf[i] += m_sScratch[i] * g;
