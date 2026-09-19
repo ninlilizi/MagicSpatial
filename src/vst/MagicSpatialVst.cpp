@@ -1059,7 +1059,7 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
 
     // --- Residuals = delayed L/R, FULL (centre NOT subtracted) ---
     // The centred midrange stays on the full-range front pair (which reach
-    // 60 Hz here) as a natural phantom, rather than being extracted off to the
+    // 65 Hz here) as a natural phantom, rather than being extracted off to the
     // thinner centre speaker — so the fronts lose no energy. The surround/height
     // feeds below are L-R differences, where centred content cancels regardless,
     // so they are unaffected by keeping the centre in the fronts.
@@ -1107,7 +1107,7 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
     }
     m_spatialTransients.Process(m_sFullMid.data(), m_sTransients.data(), frames);
 
-    // --- Feature 5: 100-500 Hz body of the mid (LR4 bandpass) ---
+    // --- Feature 5: 100-250 Hz body of the mid (LR4 bandpass) ---
     m_lowMidHp[0].Process(m_sFullMid.data(), m_sScratch.data(), frames);
     m_lowMidHp[1].Process(m_sScratch.data(), m_sLowMid.data(), frames);
     m_lowMidLp[0].Process(m_sLowMid.data(), m_sScratch.data(), frames);

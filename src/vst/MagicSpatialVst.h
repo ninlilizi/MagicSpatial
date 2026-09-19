@@ -40,7 +40,7 @@ enum class SpeakerLayout {
 //   1 - Speakers:  2.0 / 5.1.2 / 5.1.4 / 7.1.2 / 7.1.4
 //   2 - SurroundPos: Side / Rear
 //   3 - Volume:   -12..+12 dB
-//   4 - LfeCut:   40 / 60 / 80 / 100 / 120 Hz sub-bass crossover
+//   4 - LfeCut:   40 / 65 / 80 / 100 / 120 Hz sub-bass crossover
 //   5 - SubLevel: -12..+6 dB of sub weight around a level match with bypass
 class MagicSpatialVst {
 public:
@@ -110,8 +110,8 @@ private:
     // the sub takes over exactly where the fronts stop. Combo encoding is
     // sel * 0.2 over kLfeCutChoices; decoded at the midpoints.
     static constexpr int   kLfeCutCount = 5;
-    static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 60.0f, 80.0f, 100.0f, 120.0f};
-    float m_paramLfeCut = 0.2f;  // 60 Hz
+    static constexpr float kLfeCutChoices[kLfeCutCount] = {40.0f, 65.0f, 80.0f, 100.0f, 120.0f};
+    float m_paramLfeCut = 0.2f;  // 65 Hz
     int   LfeCutIndex() const;
     float LfeCutoffHz() const { return kLfeCutChoices[LfeCutIndex()]; }
 
@@ -271,7 +271,7 @@ private:
     // --- Feature 5: Low-mid envelopment feed ---
     // Bass and low-mids are mono in nearly every mix, so the L-R side signal
     // that drives every surround/height object is empty below ~300 Hz and the
-    // wash carries presence only. This feed takes the 100-500 Hz body of the
+    // wash carries presence only. This feed takes the 100-250 Hz body of the
     // MID signal, decorrelates each copy with long delays and low-break
     // allpasses (the stock presets are transparent at these wavelengths), and
     // adds it IN PHASE to the sides, backs and heights. In-phase copies survive
@@ -281,7 +281,7 @@ private:
     Decorrelator m_lowMidDecorr[8]; // [0]SL [1]SR [2]BL [3]BR [4]TFL [5]TFR [6]TBL [7]TBR
     std::vector<float> m_sLowMid;
     static constexpr float kLowMidEnvLowHz  = 100.0f;
-    static constexpr float kLowMidEnvHighHz = 500.0f;
+    static constexpr float kLowMidEnvHighHz = 250.0f;
     // Gain relative to the delayed mid, before spatialExtGain. Surround pairs
     // receive the full amount, heights half.
     static constexpr float kLowMidEnvGain       = 0.55f;
