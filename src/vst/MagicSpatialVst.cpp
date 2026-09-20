@@ -1057,8 +1057,8 @@ void MagicSpatialVst::InitSpatialDsp() {
     m_rearDelayLength = static_cast<int>(sr * static_cast<float>(kRearPreDelayMs) / 1000.0f);
     if (m_rearDelayLength > kRearPreDelayMaxSamples)
         m_rearDelayLength = kRearPreDelayMaxSamples;
-    if (m_rearDelayLength < 1)
-        m_rearDelayLength = 1;
+    if (m_rearDelayLength < 0)
+        m_rearDelayLength = 0;
     for (int i = 0; i < 4; ++i)
         m_rearDelayRing[i].assign(m_rearDelayLength, 0.0f);
     m_rearDelaySidePos = 0;
@@ -1660,8 +1660,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
         // Feature 1+4: pre-delay + diffusion on sides
         {
-            int len = m_rearDelayLength;
-            for (uint32_t i = 0; i < frames; ++i) {
+            const int len = m_rearDelayLength;
+            for (uint32_t i = 0; len > 0 && i < frames; ++i) {
                 float tmpL = m_rearDelayRing[0][m_rearDelaySidePos];
                 float tmpR = m_rearDelayRing[1][m_rearDelaySidePos];
                 m_rearDelayRing[0][m_rearDelaySidePos] = m_sSurrL[i];
@@ -1700,8 +1700,8 @@ void MagicSpatialVst::ProcessSpatialObjects(float** inputs, float** outputs, Vst
         }
         // Feature 1+4: pre-delay + diffusion on backs
         {
-            int len = m_rearDelayLength;
-            for (uint32_t i = 0; i < frames; ++i) {
+            const int len = m_rearDelayLength;
+            for (uint32_t i = 0; len > 0 && i < frames; ++i) {
                 float tmpL = m_rearDelayRing[2][m_rearDelayBackPos];
                 float tmpR = m_rearDelayRing[3][m_rearDelayBackPos];
                 m_rearDelayRing[2][m_rearDelayBackPos] = m_sSurrL[i];

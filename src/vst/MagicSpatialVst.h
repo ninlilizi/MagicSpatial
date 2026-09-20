@@ -286,9 +286,12 @@ private:
     static constexpr float kBalanceSmoothing = 0.06f; // ~120ms ramp at block rate
 
     // --- Feature 1: Early-reflection pre-delay on rear objects ---
-    // Ring-buffer delay applied to OBJ_SIDE and OBJ_BACK before submit,
-    // creating a perceptual gap between direct front image and surround wash.
-    static constexpr int kRearPreDelayMs = 5;
+    // Ring-buffer delay applied to OBJ_SIDE and OBJ_BACK before submit. It
+    // was meant to open a gap between the front image and the surround wash,
+    // but on the reference rig every millisecond of it reads as the rear pair
+    // lagging the fronts, so it now sits at zero and the ring is bypassed.
+    // Raise it only if the wash needs to sit behind the fronts again.
+    static constexpr int kRearPreDelayMs = 0;
     static constexpr int kRearPreDelayMaxSamples = 1024; // >= ceil(15ms @ 48k)
     std::vector<float> m_rearDelayRing[4]; // [0]=sideL [1]=sideR [2]=backL [3]=backR
     int m_rearDelayLength = 0;
